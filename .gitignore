@@ -1,0 +1,28 @@
+# Build artifacts
+tests/build/
+*.o
+*.d
+*.a
+*.so
+*.elf
+*.bin
+*.hex
+*.map
+/build/
+/cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# PlatformIO / Arduino
+.pio/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+*.pyc
+

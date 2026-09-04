@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  arduino-lint:
+    name: arduino-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/arduino-lint-action@v2
+        with:
+          library-manager: submit  # NOT yet in Library Manager; flip to 'update' after the registry PR is accepted
+          project-type: library
+          compliance: specification
+          recursive: true
+
+  host-tests:
+    name: host Catch2 tests (Ubuntu c++)
+    runs-on: ubuntu-latest
+    needs: arduino-lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build-essential (make / c++)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential
+      - name: Run host tests (clean-first via ci-test to defeat any stale cached .o)
+        working-directory: tests
+        run: make ci-test
+
+  compile-examples:
+    name: Compile Arduino examples (ESP8266 + ESP32)
+    runs-on: ubuntu-latest
+    needs: host-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fqbn: esp8266:esp8266:d1_mini
+            platform: esp8266:esp8266
+            platform-url: https://arduino.esp8266.com/stable/package_esp8266com_index.json
+            example: examples/ESP32_SNMP
+          - fqbn: esp32:esp32:esp32
+            platform: esp32:esp32
+            platform-url: https://dl.espressif.com/dl/package_esp32_index.json
+            example: examples/ESP32_SNMP
+          - fqbn: esp8266:esp8266:d1_mini
+            platform: esp8266:esp8266
+            platform-url: https://arduino.esp8266.com/stable/package_esp8266com_index.json
+            example: examples/SNMP_Sensor
+          - fqbn: esp32:esp32:esp32
+            platform: esp32:esp32
+            platform-url: https://dl.espressif.com/dl/package_esp32_index.json
+            example: examples/SNMP_Sensor
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
+          arduino-cli version
+      - name: Add 3rd-party platform URLs
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls '${{ matrix.platform-url }}'
+          arduino-cli core update-index
+      - name: Install platform core
+        run: arduino-cli core install ${{ matrix.platform }}
+      - name: Install example-library deps (ArduinoJson — used by SNMP_Sensor)
+        run: arduino-cli lib install "ArduinoJson"
+      - name: Install library (self, by path)
+        run: arduino-cli lib install --no-deps --git-url . || true
+      - name: Compile sketch ${{ matrix.example }} for ${{ matrix.fqbn }}
+        run: arduino-cli compile --fqbn ${{ matrix.fqbn }} --libraries . ${{ matrix.example }}
