@@ -1,4 +1,5 @@
 #include "SNMPTrap.h"
+#include "SNMP_Embedded.h"   /* v3.3.4: complete SNMPAgent for the built-in uptime mirror */
 #include "include/SNMPParser.h"
 #include "include/defs.h"
 
@@ -20,6 +21,33 @@ std::shared_ptr<ComplexType> SNMPTrap::generateVarBindList(){
     return std::shared_ptr<ComplexType>(generateVarBindListRaw(), trap_pool_deleter());
 }
 
+/* v3.3.4: trap sysUpTime resolution order —
+ *   1. sketch-supplied callback (unchanged pre-3.3.4 behaviour)
+ *   2. the library built-in uptime (default build): a static TimestampCallback
+ *      over SNMPAgent::_snmp_builtin_uptime_var, which loop() refreshes each
+ *      tick (request-time computation covers traps sent before the first
+ *      tick). GET uptime and trap timestamp can never disagree.
+ *   3. opt-out builds (SNMP_NO_BUILTIN_SYSUPTIME) with no sketch callback:
+ *      nullptr -> callers fall back to 0 exactly as pre-3.3.4. */
+TimestampCallback* SNMPTrap::effectiveUptimeCallback(){
+    if(uptimeCallback) return uptimeCallback;
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* function-local statics: no init-order hazard; never own pool state.
+     * The callback carries a REAL OID — ValueCallback::getValueForCallback
+     * unconditionally logs OID->string(), so a null OID here would crash every
+     * built-in-uptime trap send (found on hardware, Sept 2026).
+     * Heap-allocated leaky singletons: the callback destructor asn_delete()s its
+     * OID at static teardown, and a stack/static OID would be freed twice (once
+     * via asn_delete, once by its own destructor) -> abort at exit. Leak-by-design
+     * matches the pool's permanent-allocation doctrine for agent-lifetime objects. */
+    static SortableOIDType* s_builtinTsOID = new SortableOIDType(RFC1213_OID_sysUpTime);
+    static TimestampCallback* builtinTs = new TimestampCallback(s_builtinTsOID, &SNMPAgent::_snmp_builtin_uptime_var);
+    return builtinTs;
+#else
+    return nullptr;
+#endif
+}
+
 OIDType SNMPTrap::s_timestampOID(RFC1213_OID_sysUpTime);
 OIDType SNMPTrap::s_snmpTrapOID(SNMPv2_SNMPTRAP_OID_0);
 
@@ -33,8 +61,10 @@ static bool _trap_build_fill_pdu(ComplexType* trapPDU, void* userdata){
     trapPDU->addValueToListRaw(asn_new<IntegerType>(self->genericTrap));
     trapPDU->addValueToListRaw(asn_new<IntegerType>(self->specificTrap));
 
-    if(self->uptimeCallback){
-        auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(self->uptimeCallback));
+    /* v3.3.4: sketch callback wins; else the library built-in uptime supplies
+     * a live value (see SNMPTrap::effectiveUptimeCallback). */
+    if(TimestampCallback* up = self->effectiveUptimeCallback()){
+        auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(up));
         if(sp) trapPDU->addValueToListRaw(asn_new<TimestampType>(sp->_value));
         else   trapPDU->addValueToListRaw(asn_new<TimestampType>(0));
     } else {
@@ -74,8 +104,10 @@ ComplexType* SNMPTrap::generateVarBindListRaw(){
         timestampVarBind->_ownsChildren = true;
         timestampVarBind->addValueToListRaw(timestampOID->cloneRaw());
 
-        if(uptimeCallback){
-            auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(uptimeCallback));
+        /* v3.3.4: same resolution order as the v1 trap path — sketch callback,
+         * else the library built-in uptime. */
+        if(TimestampCallback* up = effectiveUptimeCallback()){
+            auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(up));
             if(sp) timestampVarBind->addValueToListRaw(asn_new<TimestampType>(sp->_value));
             else   timestampVarBind->addValueToListRaw(asn_new<TimestampType>(0));
         } else {

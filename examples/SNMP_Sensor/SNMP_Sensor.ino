@@ -68,7 +68,6 @@ const char* rwcommunity = "private"; // Read Write community string for set comm
 // RFC1213-MIB (System)
 const char* oidSysDescr = ".1.3.6.1.2.1.1.1.0";    // OctetString SysDescr
 const char* oidSysObjectID = ".1.3.6.1.2.1.1.2.0"; // OctetString SysObjectID
-const char* oidSysUptime = ".1.3.6.1.2.1.1.3.0";   // TimeTicks sysUptime (hundredths of seconds)
 const char* oidSysContact = ".1.3.6.1.2.1.1.4.0";  // OctetString SysContact
 const char* oidSysName = ".1.3.6.1.2.1.1.5.0";     // OctetString SysName
 const char* oidSysLocation = ".1.3.6.1.2.1.1.6.0"; // OctetString SysLocation
@@ -79,12 +78,13 @@ const char* oidSysServices = ".1.3.6.1.2.1.1.7.0"; // Integer sysServices
    testing. 64 B leaves room for the version string; handler keeps the pointer. */
 static char sysDescr[64] = "SNMP Agent";
 char sysObjectID[] = "";
-uint32_t sysUptime = 0;
-char sysContactValue[255];
+/* sysUpTime: NOT declared here — the library serves it as a live value
+   computed at request time (v3.3.4 built-in). No sketch code needed. */
+char sysContactValue[64];
 char *sysContact = sysContactValue;
-char sysNameValue[255];
+char sysNameValue[64];
 char *sysName = sysNameValue;
-char sysLocationValue[255];
+char sysLocationValue[64];
 char *sysLocation = sysLocationValue;
 int sysServices = 65;
 
@@ -158,8 +158,6 @@ int entPhySensorValueUpdateRate_1 = 0; // Unknown at declaration, set later.
 //* Initialise                       *
 //************************************
 // Global Variables
-static const unsigned long UPTIME_UPDATE_INTERVAL = 1000; // ms = 1 second
-static unsigned long lastUptimeUpdateTime = 0;
 static const unsigned long SENSOR_UPDATE_INTERVAL = 5000; // ms = 5 Seconds
 static unsigned long lastSensorUpdateTime = 0;
 const char* savedValuesFile = "/SNMP.json";
@@ -175,7 +173,6 @@ SNMPAgent snmp = SNMPAgent(rocommunity, rwcommunity); // Creates an SMMPAgent in
 void addRFC1213MIBHandler();
 void addENTITYMIBHandler();
 void addENTITYSENSORMIBHandler();
-int getUptime();
 bool loadSNMPValues();
 bool saveSNMPValues();
 int readFakeSensor();
@@ -217,7 +214,7 @@ void setup()
     // SNMP terminal: snmpget -v 2c -c public <IP> .1.3.6.1.2.1.1.1.0
     snprintf(sysDescr, sizeof(sysDescr), "SNMP_Sensor demo (SNMP_Embedded v%s)", snmp.getVersion());
 
-    addRFC1213MIBHandler();      // RFC1213-MIB (System) — 7 OIDs
+    addRFC1213MIBHandler();      // RFC1213-MIB (System) — 6 configurable OIDs (+ built-in sysUpTime)
 #ifndef _SNMP_ESP8266_TINY
     addENTITYMIBHandler();       // ENTITY-MIB — 18 OIDs; needs the 64-handler
                                  // default profile (ESP8266 TINY caps at 24)
@@ -245,18 +242,14 @@ void loop()
         saveSNMPValues(); // Store the values
         snmp.resetSetOccurred();
     }
-    // Periodically update Uptime. Don't need to update it on every loop as it can interfere with responding to SNMP requests
-    if (millis() - lastUptimeUpdateTime >= UPTIME_UPDATE_INTERVAL)
-    {
-        lastUptimeUpdateTime += UPTIME_UPDATE_INTERVAL;
-        sysUptime = getUptime();
-    }
+    // sysUpTime needs NO periodic update: the library computes it at request
+    // time (v3.3.4 built-in), so it stays current even if this loop() stalls.
     // Read Sensor Values
     if (millis() - lastSensorUpdateTime >= SENSOR_UPDATE_INTERVAL)
     {
         lastSensorUpdateTime += SENSOR_UPDATE_INTERVAL;
         entPhySensorValue_1 = readFakeSensor();
-        entPhySensorValueTimeStamp_1 = sysUptime;
+        entPhySensorValueTimeStamp_1 = (uint32_t)SNMPAgent::uptimeCs();  /* live library uptime */
     }
 }
 
@@ -284,11 +277,6 @@ uint64_t uptimeMillis()
     return (uint64_t)high32 << 32 | low32;
 }
 #endif
-
-int getUptime()
-{
-    return (int)(uptimeMillis() / 10); // Convert milliseconds to timeticks (hundredths of a second)
-}
 
 // Prints the content of a file to the Serial
 void printFile(const char* filename)
@@ -372,18 +360,24 @@ bool saveSNMPValues()
 
 void addRFC1213MIBHandler()
 {
-    // Add SNMP Handlers of correct type to each OID
-    snmp.addReadOnlyStaticStringHandler(oidSysDescr, sysDescr);
-    snmp.addReadOnlyStaticStringHandler(oidSysObjectID, sysObjectID);
-    snmp.addIntegerHandler(oidSysServices, &sysServices);
-    snmp.addTimestampHandler(oidSysUptime, &sysUptime);
-    // Add Settable Handlers
-    // NOTE: maxLength = sizeof(_buf) matches the 255-byte storage declared above,
-    // so SET operations via SNMP and strlcpy() from persistent storage agree on the
-    // same maximum string length.
-    snmp.addReadWriteStringHandler(oidSysContact,  &sysContact,  sizeof(sysContactValue),  true);
-    snmp.addReadWriteStringHandler(oidSysName,     &sysName,     sizeof(sysNameValue),     true);
-    snmp.addReadWriteStringHandler(oidSysLocation, &sysLocation, sizeof(sysLocationValue), true);
+    // v3.3.4: one call registers the six configurable RFC1213 system OIDs.
+    // sysUpTime is NOT in the list — the library already serves it live
+    // (computed at request time). sysObjectID is NOT covered by the helper:
+    // it is the enterprise OID, added manually below.
+    //
+    // Pass only what you want; each registered OID = 1 pool slot + its buffer.
+    // RW strings REQUIRE the buffer length (sizeof) so SETs cannot overflow,
+    // and the same length is used when restoring values from persistent
+    // storage via strlcpy().
+    snmp.addRFC1213SystemGroup(
+        sysDescr,                                // sysDescr  (read-only static string)
+        &sysContact,  sizeof(sysContactValue),   // sysContact  (read-write, 64 B)
+        &sysName,     sizeof(sysNameValue),      // sysName     (read-write, 64 B)
+        &sysLocation, sizeof(sysLocationValue),  // sysLocation (read-write, 64 B)
+        &sysServices);                           // sysServices (read-only integer)
+
+    // The one OID the helper deliberately does not own: your enterprise OID.
+    snmp.addOIDHandler(oidSysObjectID, sysObjectID);
 }
 
 void addENTITYMIBHandler()

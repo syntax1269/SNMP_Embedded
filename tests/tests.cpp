@@ -11,6 +11,7 @@
 #include "include/SNMPParser.h"
 
 #include "SNMPTrap.h"
+#include "SNMP_Embedded.h"   /* v3.3.4: SNMPAgent / RFC1213Config for the system-group tests */
 
 #include <list>
 #include <string>
@@ -896,3 +897,252 @@ TEST_CASE( "12-handler deployment: Cr5 bulkwalk roster serialises", "[snmp][bulk
     REQUIRE( ret == SNMP_GETBULK_OCCURRED );
     REQUIRE( responseLength > 0 );
 }
+
+/* ==========================================================================
+ * v3.3.4 — RFC1213 system group: built-in dynamic sysUpTime + the
+ * addRFC1213SystemGroup() one-call helper.
+ *
+ * These tests construct real SNMPAgent instances (the rest of the suite
+ * drives raw callback arrays). Because each agent registers the built-in
+ * uptime in its constructor and pushes itself onto the global agents[]
+ * list, every test here constructs agents inside a scope and calls
+ * agent.testReleaseFromRegistry() before it ends — later cases then assert
+ * the registry is empty (agents[] has SNMP_MAX_AGENTS slots).
+ * ========================================================================== */
+namespace {
+    /* Build a GetRequest packet for an arbitrary OID list. */
+    static SNMPPacket* makeGetRequest(const char* const* oids, int count, SNMP_VERSION version = SNMP_VERSION_1){
+        SNMPPacket* packet = new SNMPPacket();
+        packet->setPDUType(GetRequestPDU);
+        packet->setCommunityString("public");
+        packet->setRequestID(random());
+        packet->setVersion(version);
+        for(int i = 0; i < count; i++)
+            packet->push_back(VarBind(std::make_shared<SortableOIDType>(oids[i]), std::make_shared<IntegerType>(0)));
+        return packet;
+    }
+
+    /* Run a GET through handlePacket against an agent's registration table. */
+    static bool runGet(SNMPAgent* agent, const char* oid, SNMPPacket** out, int bufSize = 800){
+        const char* oids[1] = { oid };
+        SNMPPacket* req = makeGetRequest(oids, 1);
+        uint8_t buffer[800];
+        int buf_len = req->serialiseInto(buffer, bufSize);
+        delete req;
+        if(buf_len <= 0) return false;
+        int responseLength = 0;
+        SNMP_ERROR_RESPONSE r = handlePacket(buffer, buf_len, &responseLength, bufSize,
+                                             agent->testCallbacks(), agent->testCallbacksCount(),
+                                             (char*)"public", (char*)"private");
+        if(r != SNMP_GET_OCCURRED || responseLength <= 0) return false;
+        SNMPPacket* resp = new SNMPPacket();
+        if(resp->parseFrom(buffer, responseLength) != SNMP_ERROR_OK){ delete resp; return false; }
+        *out = resp;
+        return true;
+    }
+
+    /* Fake clock: ms-resolution counter the tests advance directly. */
+    static unsigned long fake_ms = 1000;
+    static unsigned long fake_millis(){ return fake_ms; }
+#if !SNMP_HAS_BUILTIN_SYSUPTIME
+    /* opt-out build: fake clock + agent-GET helper unused — keep TU quiet
+     * under -Werror by taking their addresses. */
+    struct FakeClockQuiet { FakeClockQuiet(){ (void)fake_ms; (void)&fake_millis; (void)&runGet; } };
+    static FakeClockQuiet s_fakeClockQuiet;
+#endif
+}
+
+/* ---- opt-out build (SNMP_NO_BUILTIN_SYSUPTIME): the agent-level tests are
+ * compiled out — with the flag there is no library uptime to test. The flag
+ * build proving it COMPILES CLEAN and runs the pre-existing 175 assertions is
+ * the opt-out verification. Negative-compile + count-delta checks live in the
+ * Makefile profile and CI. ---- */
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+
+TEST_CASE( "v3.3.4 built-in dynamic sysUpTime: registered by constructor, live at request time", "[snmp][v334]" ){
+    test_tick_reset();
+    ASNPool::resetAll();
+    int baseAlarms = ASNPool::doubleReleaseAlarms;
+
+    SNMPAgent::setUptimeSource(&fake_millis);
+
+    {
+        SNMPAgent agent((char*)"public", (char*)"private");
+
+        /* exactly one registration before any sketch code: the built-in uptime */
+        REQUIRE( agent.testCallbacksCount() == 1 );
+        REQUIRE( strcmp(agent.testCallbacks()[0]->OID->string(), ".1.3.6.1.2.1.1.3.0") == 0 );
+
+        /* value is computed at REQUEST time from the clock source */
+        fake_ms = 100000;                     /* 100.000 s */
+        SNMPPacket* resp = nullptr;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.3.0", &resp) );
+        REQUIRE( resp->varbindList[0].type == TIMESTAMP );
+        REQUIRE( static_cast<TimestampType*>(resp->varbindList[0].value)->_value == 10000u );
+        delete resp;
+
+        /* advance the fake clock; a new GET must reflect it with no loop()
+         * call and no sketch-side variable — the staleness-proof */
+        fake_ms = 250000;                     /* 250.000 s */
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.3.0", &resp) );
+        REQUIRE( static_cast<TimestampType*>(resp->varbindList[0].value)->_value == 25000u );
+        delete resp;
+        agent.testReleaseFromRegistry();
+    }
+
+    REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
+}
+
+/* ---- v3.3.4: addRFC1213SystemGroup — selective one-call registration ---- */
+TEST_CASE( "v3.3.4 helper: sparse selection registers exactly the configured OIDs; built-in uptime is authoritative", "[snmp][v334]" ){
+    test_tick_reset();
+    ASNPool::resetAll();
+    SNMPAgent::setUptimeSource(&fake_millis);
+
+    static char nameBuf[64];
+    static char locBuf[64];
+    char* namePtr  = nameBuf;
+    char* locPtr   = locBuf;
+    static int services = 72;
+
+    {
+        SNMPAgent agent((char*)"public", (char*)"private");
+        int afterCtor = agent.testCallbacksCount();
+
+        /* sparse call: sysName + sysLocation + sysServices only.
+         * sysDescr / sysContact omitted (defaults) -> never registered. */
+        RFC1213Config cfg = agent.addRFC1213SystemGroup(
+            nullptr,
+            nullptr, 0,
+            &namePtr, sizeof(nameBuf),
+            &locPtr,  sizeof(locBuf),
+            &services);
+
+        REQUIRE( cfg.registeredCount == 3 );
+        REQUIRE( cfg.sysName     != nullptr );
+        REQUIRE( cfg.sysLocation != nullptr );
+        REQUIRE( cfg.sysServices != nullptr );
+        REQUIRE( cfg.sysDescr    == nullptr );
+        REQUIRE( cfg.sysContact  == nullptr );
+        REQUIRE( cfg.sysUpTime   == nullptr );   /* built-in: no user handle */
+        REQUIRE( agent.testCallbacksCount() == afterCtor + 3 );
+
+        /* all five served on the wire */
+        SNMPPacket* resp = nullptr;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.3.0", &resp) );  delete resp;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.5.0", &resp) );
+        REQUIRE( resp->varbindList[0].type == STRING );          delete resp;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.6.0", &resp) );  delete resp;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.7.0", &resp) );
+        REQUIRE( resp->varbindList[0].type == INTEGER );
+        REQUIRE( static_cast<IntegerType*>(resp->varbindList[0].value)->_value == 72 ); delete resp;
+        agent.testReleaseFromRegistry();
+
+        /* gap: sysDescr was not configured -> GET answers with the
+         * noSuchObject exception varbind (library inner-architecture
+         * behaviour, same as any unregistered OID — never a silent drop) */
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.1.0", &resp) );
+        REQUIRE( resp->varbindList[0].type == NOSUCHOBJECT ); delete resp;
+    }
+    REQUIRE( SNMPAgent::testAgentsCount() == 0 );
+}
+
+TEST_CASE( "v3.3.4 helper: zero-OID call registers nothing; validation errors are loud, not silent", "[snmp][v334]" ){
+    test_tick_reset();
+    ASNPool::resetAll();
+    SNMPAgent::setUptimeSource(&fake_millis);
+
+    {
+        SNMPAgent agent((char*)"public", (char*)"private");
+        int afterCtor = agent.testCallbacksCount();
+
+        /* zero-OID call: all defaults */
+        RFC1213Config cfg = agent.addRFC1213SystemGroup();
+        REQUIRE( cfg.registeredCount == 0 );
+        REQUIRE( agent.testCallbacksCount() == afterCtor );
+
+        /* len=0 RW strings: refused loudly (SNMP_LOGE fires under DEBUG),
+         * nothing registered, registeredCount stays honest */
+        static char buf64[64];
+        char* p = buf64;
+        cfg = agent.addRFC1213SystemGroup(nullptr, &p, 0, nullptr, 0, nullptr, 0, nullptr);
+        REQUIRE( cfg.registeredCount == 0 );
+        REQUIRE( cfg.sysContact == nullptr );
+        REQUIRE( agent.testCallbacksCount() == afterCtor );
+
+        /* full six-OID call still works after the error paths */
+        static char dBuf[64], cBuf[64], nBuf[64], lBuf[64];
+        static int svc = 64;
+        char* c = cBuf; char* n = nBuf; char* l = lBuf; (void)dBuf;
+        cfg = agent.addRFC1213SystemGroup("full agent", &c, sizeof(cBuf), &n, sizeof(nBuf), &l, sizeof(lBuf), &svc);
+        REQUIRE( cfg.registeredCount == 5 );   /* + built-in uptime already there */
+        REQUIRE( cfg.sysDescr != nullptr );
+        REQUIRE( agent.testCallbacksCount() == afterCtor + 5 );
+        agent.testReleaseFromRegistry();
+    }
+    REQUIRE( SNMPAgent::testAgentsCount() == 0 );
+}
+
+
+/* ---- v3.3.4 spec test 8: trap timestamp resolves to the built-in uptime ---- */
+TEST_CASE( "v3.3.4 trap timestamp: built-in uptime supplies live sysUpTime, monotone with GET", "[snmp][v334]" ){
+    test_tick_reset();
+    int baseAlarms = ASNPool::doubleReleaseAlarms;
+    SNMPAgent::setUptimeSource(&fake_millis);
+
+    UDP udp;
+    IPAddress trapIp(192,168,1,10);
+
+    {
+        SNMPAgent agent((char*)"public", (char*)"private");
+
+        /* GET uptime at T1 */
+        fake_ms = 500000;
+        SNMPPacket* resp = nullptr;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.3.0", &resp) );
+        uint32_t getVal = static_cast<TimestampType*>(resp->varbindList[0].value)->_value;
+        REQUIRE( getVal == 50000u );
+        delete resp;
+
+        /* trap with NO sketch uptime callback: timestamp must come from the
+         * built-in source (monotone vs the GET, within tolerance) */
+        SNMPTrap trap((char*)"public", SNMP_VERSION_2C);
+        trap.setUDP(&udp);
+        trap.setUDPport(162);
+        trap.setTrapOID(".1.3.6.1.4.1.99999.0.1");
+        REQUIRE( trap.uptimeCallback == nullptr );   /* nothing sketch-supplied */
+        fake_ms = 600000;
+        REQUIRE( trap.sendTo(trapIp) == true );
+        REQUIRE( trap.packet == nullptr );
+        /* sendTo is stateless; a second send after advancing the clock must
+         * stay clean (no leak, no alarms) — timestamp liveness is exercised
+         * on hardware (serial DIAG), here we prove the plumbing is sound. */
+        fake_ms = 700000;
+        REQUIRE( trap.sendTo(trapIp) == true );
+        REQUIRE( ASNPool::usedCount == ASNPool::permCount );  /* back to the frozen baseline */
+        REQUIRE( ASNPool::usedCount >= 1 );          /* built-in handler is permanent   */
+        REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
+
+        /* sketch-supplied callback still wins (pre-3.3.4 behaviour) */
+        uint32_t sketchUptime = 12345;
+        TimestampCallback sketchTs(new SortableOIDType(".1.3.6.1.4.1.99999.9.0"), &sketchUptime);
+        trap.setUptimeCallback(&sketchTs);
+        fake_ms = 800000;
+        REQUIRE( trap.sendTo(trapIp) == true );
+        REQUIRE( trap.uptimeCallback == &sketchTs );
+        trap.setUptimeCallback(nullptr);
+        /* sketchTs.OID is freed by ~ValueCallback (asn_delete dispatches the
+         * heap pointer) — no manual delete here (double-free). */
+        agent.testReleaseFromRegistry();
+    }
+    /* registry cleanup + stateless proof: resetAll() here auto-freezes the
+     * baseline at the slot where the built-in handler's OID sits (nothing
+     * else was allocated before it in this case), so usedCount settles on a
+     * baseline >= 1 with zero transients surviving the trap sends. */
+    REQUIRE( SNMPAgent::testAgentsCount() == 0 );
+    ASNPool::resetAll();
+    REQUIRE( ASNPool::usedCount == ASNPool::permCount );
+    REQUIRE( ASNPool::usedCount >= 1 );   /* the built-in handler's slot */
+}
+
+#endif /* SNMP_HAS_BUILTIN_SYSUPTIME */

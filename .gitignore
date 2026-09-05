@@ -1,5 +1,6 @@
 # Build artifacts
 tests/build/
+tests/build-nouptime/
 *.o
 *.d
 *.a

@@ -38,7 +38,6 @@ SNMPAgent snmp = SNMPAgent("public", "private");
 // Numbers used to response to Get requests
 int changingNumber = 1;
 int settableNumber = 0;
-uint32_t tensOfMillisCounter = 0;
 
 // arbitrary data will be stored here to act as an OPAQUE data-type
 uint8_t stuff[4];
@@ -47,7 +46,6 @@ uint8_t stuff[4];
 // If we want to change the functionaality of an OID callback later, store them here.
 ValueCallback* changingNumberOID;
 ValueCallback* settableNumberOID;
-TimestampCallback* timestampCallbackOID;
 
 char staticString[] = "This value will never change";
 
@@ -92,10 +90,13 @@ void setup(){
     stuff[2] = 24;
     stuff[3] = 67;
     
-    // RFC1213 sysDescr: serves the library version, queryable from the SNMP terminal:
-    //   snmpget -v 2c -c public <IP> .1.3.6.1.2.1.1.1.0
+    // RFC1213 system group, minimal legal agent: sysDescr only. The helper
+    // registers JUST this OID (1 slot + buffer); unlisted system OIDs answer
+    // noSuchName (v1) / noSuchObject (v2c), and the BUILT-IN sysUpTime
+    // (.1.3.6.1.2.1.1.3.0, registered by the library automatically) is always
+    // live. Query it with:  snmpget -v 2c -c public <IP> .1.3.6.1.2.1.1.3.0
     snprintf(sysDescrBuf, sizeof(sysDescrBuf), "ESP32_SNMP demo (SNMP_Embedded v%s)", snmp.getVersion());
-    snmp.addReadOnlyStaticStringHandler(".1.3.6.1.2.1.1.1.0", sysDescrBuf);
+    snmp.addRFC1213SystemGroup(sysDescrBuf);
 
     // add 'callback' for an OID - pointer to an integer
     changingNumberOID = snmp.addIntegerHandler(".1.3.6.1.4.1.5.0", &changingNumber);
@@ -119,15 +120,13 @@ void setup(){
 
 
     // Setup SNMP TRAP
-    // The SNMP Trap spec requires an uptime counter to be sent along with the trap.
-    timestampCallbackOID = (TimestampCallback*)snmp.addTimestampHandler(".1.3.6.1.2.1.1.3.0", &tensOfMillisCounter);
+    // v3.3.4: no uptime counter or callback needed — when no sketch callback
+    // is set, the trap timestamp comes from the library's built-in live
+    // uptime automatically (always current, zero maintenance).
 
     settableNumberTrap->setUDP(&udp); // give a pointer to our UDP object
     settableNumberTrap->setTrapOID(new OIDType(".1.3.6.1.2.1.33.2")); // OID of the trap
-    settableNumberTrap->setSpecificTrap(1); 
-
-    // Set the uptime counter to use in the trap (required)
-    settableNumberTrap->setUptimeCallback(timestampCallbackOID);
+    settableNumberTrap->setSpecificTrap(1);
 
     // Set some previously set OID Callbacks to send these values with the trap (optional)
     settableNumberTrap->addOIDPointer(changingNumberOID);
@@ -170,5 +169,4 @@ void loop(){
         }
     }
     changingNumber++;
-    tensOfMillisCounter = millis()/10;
 }

@@ -4,6 +4,150 @@ const char* SNMP_TAG = "SNMP";
 SNMPAgent* SNMPAgent::agents[SNMP_MAX_AGENTS] = {nullptr};
 int SNMPAgent::agentsCount = 0;
 
+/* ==========================================================================
+ * v3.3.4 built-in dynamic sysUpTime
+ * --------------------------------------------------------------------------
+ * The one sanctioned library-owned OID. Computed at REQUEST time from the
+ * uptime source — never refreshed in loop(), so it cannot go stale when
+ * sketch code blocks. Value is TimeTicks (centiseconds): millis()/10, with
+ * the standard ~497-day 32-bit wrap (managers handle TimeTicks wrap; this
+ * matches commercial agent behaviour).
+ *
+ * The clock source is a settable function pointer. Tests inject a fake clock
+ * to prove request-time computation; on hardware it points at plain millis().
+ * The same source feeds trap sysUpTime timestamps (SNMPTrap), so a GET and a
+ * trap sent back-to-back can never disagree.
+ * ========================================================================== */
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+static unsigned long (*snmp_uptime_source)() = [](){ return millis(); };
+
+void SNMPAgent::setUptimeSource(unsigned long (*source)()){
+    snmp_uptime_source = source ? source : [](){ return millis(); };
+}
+
+unsigned long SNMPAgent::uptimeCs(){
+    return (unsigned long)(snmp_uptime_source() / 10u);
+}
+
+uint32_t snmp_builtin_uptime_cs(){
+    return (uint32_t)SNMPAgent::uptimeCs();
+}
+#endif
+
+/* ---- v3.3.4 built-in registration + trap timestamp mirror ---------------- */
+uint32_t SNMPAgent::_snmp_builtin_uptime_var = 0;
+
+void SNMPAgent::registerBuiltinUptime(){
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* overwritePrefix=true: the system group must never receive the user's
+     * OID prefix, even if begin(prefix) ran before registration. */
+    ValueCallback* cb = this->addDynamicReadOnlyTimestampHandler(RFC1213_OID_sysUpTime, &snmp_builtin_uptime_cs, true);
+    if(cb){
+        /* LOUD duplicate-ownership warning: a sketch that also registers
+         * sysUpTime (addTimestampHandler on .1.3.6.1.2.1.1.3.0) collides with
+         * the built-in. The FIRST registration (the built-in) serves GETs, so
+         * a sketch handler would silently never be consulted — refuse it
+         * instead of leaving dead state. Sketches that own uptime should
+         * define SNMP_NO_BUILTIN_SYSUPTIME (global build flag). */
+        this->_builtinUptimeCb = cb;
+    } else {
+        SNMP_LOGE("registerBuiltinUptime: FAILED to register built-in sysUpTime (callbacks full before any sketch code?).\n");
+    }
+#else
+    /* SNMP_NO_BUILTIN_SYSUPTIME: nothing registered. The sketch owns uptime
+     * (and trap timestamps) exactly as in pre-3.3.4 builds. */
+#endif
+}
+
+uint32_t SNMPAgent::builtinUptimeCs(){
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    return SNMPAgent::uptimeCs();
+#else
+    return 0;   /* no library uptime in opt-out builds; traps use sketch callbacks */
+#endif
+}
+
+/* addRFC1213SystemGroup() — one-call registration of any subset of the six
+ * configurable RFC1213 system OIDs. Unlisted OIDs (default nullptr) are simply
+ * never registered: no slot, no buffer, and a manager's GET on the gap answers
+ * noSuchName (v1) / noSuchObject (v2c) while walks bridge cleanly.
+ *
+ * sysObjectID is deliberately NOT a parameter — it is the user's enterprise
+ * OID; add it manually if wanted: snmp.addOIDHandler(RFC1213_OID_sysObjectID, "1.3.6.1.4.1.99999");
+ *
+ * Rules enforced (loud, never silent):
+ *   - RW strings require len > 0 (a zero-length buffer is a configuration
+ *     error: the OID is NOT registered, error logged).
+ *   - With the built-in uptime active, a caller uptime binding is refused
+ *     (the built-in value is authoritative; double registration would be a
+ *     duplicate-OID conflict).
+ *   - The helper must be the only registrar for its six OIDs — a prior manual
+ *     registration collides through the normal duplicate-OID path and is
+ *     logged.
+ */
+RFC1213Config SNMPAgent::addRFC1213SystemGroup(
+        const char* sysDescr,
+        char**      sysContact,    size_t contactLen,
+        char**      sysName,       size_t nameLen,
+        char**      sysLocation,   size_t locationLen,
+        int*         sysServices)
+{
+    RFC1213Config cfg;
+
+    if(sysDescr){
+        ValueCallback* cb = this->addReadOnlyStaticStringHandler(RFC1213_OID_sysDescr, sysDescr, true);
+        if(cb){ cfg.sysDescr = cb; cfg.registeredCount++; }
+        else { SNMP_LOGE("addRFC1213SystemGroup: sysDescr registration failed (duplicate OID? callbacks full?)\n"); }
+    }
+
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* Built-in dynamic uptime is registered in the constructor; nothing to do.
+     * cfg.sysUpTime stays nullptr by design — there is no user handle for it.
+     * The uptimeDynamic/uptimeStatic parameters were dropped in favour of this
+     * simpler contract: callers wanting a sketch-owned uptime define
+     * SNMP_NO_BUILTIN_SYSUPTIME and register it themselves. */
+    (void)0;
+#endif
+
+    if(sysContact){
+        if(contactLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysContact given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            ValueCallback* cb = this->addReadWriteStringHandler(RFC1213_OID_sysContact, sysContact, contactLen, true, true);
+            if(cb){ cfg.sysContact = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysContact registration failed\n"); }
+        }
+    }
+
+    if(sysName){
+        if(nameLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysName given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            ValueCallback* cb = this->addReadWriteStringHandler(RFC1213_OID_sysName, sysName, nameLen, true, true);
+            if(cb){ cfg.sysName = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysName registration failed\n"); }
+        }
+    }
+
+    if(sysLocation){
+        if(locationLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysLocation given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            ValueCallback* cb = this->addReadWriteStringHandler(RFC1213_OID_sysLocation, sysLocation, locationLen, true, true);
+            if(cb){ cfg.sysLocation = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysLocation registration failed\n"); }
+        }
+    }
+
+    if(sysServices){
+        ValueCallback* cb = this->addIntegerHandler(RFC1213_OID_sysServices, sysServices, false, true);
+        if(cb){ cfg.sysServices = cb; cfg.registeredCount++; }
+        else { SNMP_LOGE("addRFC1213SystemGroup: sysServices registration failed\n"); }
+    }
+
+    return cfg;
+}
+
 void SNMPAgent::setUDP(UDP* udp){
     if(this->udpCount >= SNMP_MAX_UDP_PER_AGENT){
         SNMP_LOGE("setUDP: _udp[] full (%d slots). Raise SNMP_MAX_UDP_PER_AGENT.\n", SNMP_MAX_UDP_PER_AGENT);
@@ -39,6 +183,14 @@ SNMP_ERROR_RESPONSE SNMPAgent::loop(){
      * tick is covered the same way. Explicit freezePermCount() in setup()
      * remains supported and takes precedence. */
     ASNPool::resetAll();
+
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* Keep the trap-timestamp mirror fresh once per tick. GETs don't need it
+     * (computed at request time); traps read it when the sketch did not
+     * supply its own uptime callback. A trap sent from setup() before the
+     * first loop() tick computes the value directly — always correct. */
+    SNMPAgent::_snmp_builtin_uptime_var = SNMPAgent::uptimeCs();
+#endif
 
     for(int i = 0; i < udpCount; i++){
         UDP* udp = _udp[i];
@@ -222,6 +374,19 @@ ValueCallback* SNMPAgent::addGaugeHandler(const char *oid, uint32_t* value, bool
 ValueCallback * SNMPAgent::addHandler(ValueCallback *callback, bool isSettable) {
     if(!callback) return nullptr;
     callback->isSettable = isSettable;
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* v3.3.4: refuse a SECOND registration of the built-in sysUpTime OID.
+     * The built-in is registered first and serves GETs; a later sketch
+     * handler on the same OID would be dead state (and a walk duplicate).
+     * Sketches that want to own sysUpTime define SNMP_NO_BUILTIN_SYSUPTIME. */
+    if(this->_builtinUptimeCb && callback != this->_builtinUptimeCb &&
+       callback->OID && this->_builtinUptimeCb->OID &&
+       strcmp(callback->OID->string(), this->_builtinUptimeCb->OID->string()) == 0){
+        SNMP_LOGE("addHandler: sysUpTime is registered by the library (built-in dynamic). Duplicate registration REFUSED. Define SNMP_NO_BUILTIN_SYSUPTIME if you want to own uptime yourself.\n");
+        delete callback;
+        return nullptr;
+    }
+#endif
     if(this->callbacksCount >= SNMP_MAX_CALLBACKS_PER_AGENT){
         SNMP_LOGE("addHandler: callbacks[] full (%d slots), OID %s NOT registered. Raise SNMP_MAX_CALLBACKS_PER_AGENT.\n",
                   SNMP_MAX_CALLBACKS_PER_AGENT, callback->OID ? callback->OID->string() : "(null)");

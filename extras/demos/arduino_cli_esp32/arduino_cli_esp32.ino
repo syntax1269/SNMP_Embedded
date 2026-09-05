@@ -43,6 +43,11 @@ static int      myInteger = 42;                  // SETtable via snmpset
 static char     sensorName[] = "ESP32-Sensor";
 static uint32_t counter32 = 0;
 
+/* RFC1213 system group buffers (sparse selection — see setup()). */
+static char sysDescrBuf[64]   = "ESP32 minimal demo (SNMP_Embedded)";
+static char sysContactBuf[64] = "ops@example.com";
+static char* sysContactPtr = sysContactBuf;
+
 static uint32_t getUptimeSeconds(void) { return (uint32_t)(millis() / 1000U); }
 
 void setup()
@@ -65,7 +70,19 @@ void setup()
     agent.setUDP(&udp);
     agent.begin();
 
-    // Three representative handlers (integer / static string / dynamic timestamp).
+    // SPARSE system group (v3.3.4 helper): sysDescr + sysContact only.
+    // You NEVER maintain uptime yourself — sysUpTime is registered by the
+    // library automatically and computed at request time, so it is current
+    // even right after a loop() stall. Check it twice a second apart:
+    //   snmpget -v 2c -c public <ip> .1.3.6.1.2.1.1.3.0
+    agent.addRFC1213SystemGroup(
+        sysDescrBuf,                           // sysDescr (read-only static string)
+        &sysContactPtr, sizeof(sysContactBuf), // sysContact (read-write)
+        nullptr, 0,                            // sysName     — not configured
+        nullptr, 0,                            // sysLocation — not configured
+        nullptr);                              // sysServices — not configured
+
+    // Three representative custom handlers (integer / static string / dynamic timestamp).
     agent.addIntegerHandler(".1.3.6.1.4.1.5.0", &myInteger, true);
     agent.addReadOnlyStaticStringHandler(".1.3.6.1.4.1.5.1", sensorName);
     agent.addDynamicReadOnlyTimestampHandler(".1.3.6.1.4.1.5.2", getUptimeSeconds);

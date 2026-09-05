@@ -75,6 +75,12 @@ void setup()
     agent.setUDP(&udp);
     agent.begin();
 
+    // ZERO RFC1213 system OIDs is a valid posture: this demo registers no
+    // system group at all, so the pool holds exactly the custom handlers
+    // below (+1 slot for the library's built-in sysUpTime; define
+    // SNMP_NO_BUILTIN_SYSUPTIME as a global build flag to reclaim even that).
+    // To add a system group later, one call does it:
+    //   agent.addRFC1213SystemGroup(sysDescrBuf);
     // Three representative handlers (integer / static string / dynamic timestamp).
     agent.addIntegerHandler(".1.3.6.1.4.1.5.0", &myInteger, true);
     agent.addReadOnlyStaticStringHandler(".1.3.6.1.4.1.5.1", sensorName);

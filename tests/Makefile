@@ -54,7 +54,17 @@ $(BUILD_DIR)/%.ino.o: %.ino
 	rm $@.cpp
 
 
-.PHONY: clean test benchmark example ci-test
+.PHONY: clean test benchmark example ci-test test-nobuiltinuptime ci-test-nobuiltinuptime
+
+# v3.3.4: opt-out profile — SNMP_NO_BUILTIN_SYSUPTIME build. Separate BUILD_DIR
+# so the two profiles never share stale objects. Verifies (a) clean compile with
+# the flag, (b) pool/callback counts exactly one less than the default build,
+# (c) sysUpTime behaves as an unregistered OID.
+test-nobuiltinuptime:
+	$(MAKE) BUILD_DIR=./build-nouptime clean
+	$(MAKE) BUILD_DIR=./build-nouptime CPPFLAGS="$(CPPFLAGS) -DSNMP_NO_BUILTIN_SYSUPTIME" test
+
+ci-test-nobuiltinuptime: test-nobuiltinuptime
 
 clean:
 	$(RM) -r ./build

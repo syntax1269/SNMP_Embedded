@@ -45,6 +45,15 @@ static int      myInteger = 42;                  // SETtable via snmpset
 static char     sensorName[] = "ESP8266-Sensor";
 static uint32_t counter32 = 0;
 
+/* RFC1213 system group buffers. Only what you pass gets registered —
+ * each registered OID = 1 pool slot + its buffer; gaps answer
+ * noSuchName (v1) / noSuchObject (v2c) and walks bridge them. */
+static char sysDescrBuf[64]   = "ESP8266 minimal demo (SNMP_Embedded)";
+static char sysNameBuf[64]    = "esp8266-demo";
+static char sysLocationBuf[64] = "rack-1";
+static char* sysNamePtr     = sysNameBuf;      // RW handlers take char**
+static char* sysLocationPtr = sysLocationBuf;
+
 static uint32_t getUptimeSeconds(void) { return (uint32_t)(millis() / 1000U); }
 
 void setup()
@@ -67,7 +76,19 @@ void setup()
     agent.setUDP(&udp);
     agent.begin();
 
-    // Three representative handlers (integer / static string / dynamic timestamp).
+    // SPARSE system group (v3.3.4 helper): sysDescr + sysName + sysLocation
+    // only — sysContact / sysServices are simply not registered (see the
+    // nullptr defaults below), and sysUpTime is already live via the
+    // library's built-in registration. Try the gap yourself:
+    //   snmpget -v 2c -c public <ip> .1.3.6.1.2.1.1.4.0   -> noSuchObject
+    agent.addRFC1213SystemGroup(
+        sysDescrBuf,                       // sysDescr (read-only static string)
+        nullptr, 0,                        // sysContact  — not configured
+        &sysNamePtr,    sizeof(sysNameBuf),    // sysName     (read-write)
+        &sysLocationPtr, sizeof(sysLocationBuf), // sysLocation (read-write)
+        nullptr);                          // sysServices — not configured
+
+    // Three representative custom handlers (integer / static string / dynamic timestamp).
     agent.addIntegerHandler(".1.3.6.1.4.1.5.0", &myInteger, true);
     agent.addReadOnlyStaticStringHandler(".1.3.6.1.4.1.5.1", sensorName);
     agent.addDynamicReadOnlyTimestampHandler(".1.3.6.1.4.1.5.2", getUptimeSeconds);

@@ -27,14 +27,19 @@
 
 #include <stdint.h>
 
+/* v3.3.4: define SNMP_NO_BUILTIN_SYSUPTIME (global build flag / sketch define
+ * BEFORE including SNMP_Embedded.h) to remove the library-registered dynamic
+ * sysUpTime handler (reclaims exactly 1 pool slot). With the flag, sysUpTime
+ * becomes a normal OID the sketch may register itself. */
+
 #ifndef DEBUG
     #define DEBUG           0       /* 0  or  1  or  2 */
 #endif
 
 #define LIBRARY_VERSION_MAJOR 3
 #define LIBRARY_VERSION_MINOR 3
-#define LIBRARY_VERSION_PATCH 3
-#define LIBRARY_VERSION "3.3.3"
+#define LIBRARY_VERSION_PATCH 4
+#define LIBRARY_VERSION "3.3.4"
 
 typedef enum SNMP_ERROR_RESPONSE {
     SNMP_NO_UDP = -10,
@@ -178,6 +183,18 @@ static_assert( (SNMP_MAX_VARBINDS * SNMP_WORST_CASE_VARBIND_BYTES + SNMP_PACKET_
     #define SNMP_MAX_CALLBACKS_PER_AGENT   64   /* Maximum OID handlers registered per SNMPAgent instance.  Large sensor deployments
                                                    have ~32; 64 covers a device exposing every numeric column of a 30-row table. */
   #endif
+#endif
+
+/* v3.3.4: the built-in dynamic sysUpTime registration counts against the same
+ * derived-sizing budget as every other handler — it is an ordinary
+ * addDynamicReadOnlyTimestampHandler() call, so the pool math picks it up
+ * automatically. Compile-time footprint pins (default +1, opt-out +0) below. */
+#ifndef SNMP_NO_BUILTIN_SYSUPTIME
+  #define SNMP_HAS_BUILTIN_SYSUPTIME 1
+  static_assert(SNMP_MAX_CALLBACKS_PER_AGENT >= 1,
+                "SNMP_MAX_CALLBACKS_PER_AGENT must be >= 1 to hold the built-in sysUpTime handler (define SNMP_NO_BUILTIN_SYSUPTIME to opt out)");
+#else
+  #define SNMP_HAS_BUILTIN_SYSUPTIME 0
 #endif
 #ifndef SNMP_MAX_AGENTS
     #define SNMP_MAX_AGENTS                  2   /* Concurrent SNMPAgent instances.  ESP8266 almost always 1; 2 allows dual-interface. */
@@ -436,23 +453,29 @@ typedef enum ERROR_STATUS_WITH_VALUE {
 // Used for situations where in V2 an error exists but in V1 a less-specific error exists that isn't GEN_ERR
 #define SNMP_ERROR_VERSION_CTRL_DEF(error, version, elseError) (((version) == SNMP_VERSION_1 && (error) > SNMP_V1_MAX_ERROR) ? SNMP_ERROR_VERSION_CTRL(elseError, version) : error)
 
-// RFC1213 OIDs
-#define RFC1213_OID_sysDescr            (".1.3.6.1.2.1.1.1.0")
+/* RFC1213 OIDs — access modes per RFC 1213. All seven are registered ONLY when a
+ * sketch (or the built-in sysUpTime, below) asks for them: no library pre-allocation.
+ * The addRFC1213SystemGroup() helper owns the six configurable ones (see README). */
+#define RFC1213_OID_sysDescr            (".1.3.6.1.2.1.1.1.0")   /* Read-only; helper param 1  */
 #define RFC1213_OID_sysObjectID         (".1.3.6.1.2.1.1.2.0")
-#define RFC1213_OID_sysUpTime           (".1.3.6.1.2.1.1.3.0")
+#define RFC1213_OID_sysUpTime           (".1.3.6.1.2.1.1.3.0")   /* Read-only; BUILT-IN dynamic (library-computed at request time) unless SNMP_NO_BUILTIN_SYSUPTIME is defined */
 #define SNMPv2_SNMPTRAP_OID_0           (".1.3.6.1.6.3.1.1.4.1.0")   /* RFC 3416 §4.2.6/§4.2.7: mandatory varbind #2 NAME in SNMPv2c Trap/Inform.
                                                                          Value is the NOTIFICATION-TYPE OID supplied via SNMPTrap::setTrapOID() */
-#define RFC1213_OID_sysContact          (".1.3.6.1.2.1.1.4.0")
-#define RFC1213_OID_sysName             (".1.3.6.1.2.1.1.5.0")
-#define RFC1213_OID_sysLocation         (".1.3.6.1.2.1.1.6.0")
-#define RFC1213_OID_sysServices         (".1.3.6.1.2.1.1.7.0")
+#define RFC1213_OID_sysContact          (".1.3.6.1.2.1.1.4.0")   /* Read-Write; helper param (needs buffer length) */
+#define RFC1213_OID_sysName             (".1.3.6.1.2.1.1.5.0")   /* Read-Write; helper param (needs buffer length) */
+#define RFC1213_OID_sysLocation         (".1.3.6.1.2.1.1.6.0")   /* Read-Write; helper param (needs buffer length) */
+#define RFC1213_OID_sysServices         (".1.3.6.1.2.1.1.7.0")   /* Read-only; helper param (typical: 72 IP+TCP host, 64 L3 device, 0 endpoint) */
 
+/* CONVENIENCE TYPE ONLY — the library never instantiates or pre-allocates this
+ * struct; system OIDs exist only for the handlers a sketch registers (or the
+ * built-in sysUpTime). sysObjectID is deliberately outside the helper: it is
+ * the user's enterprise OID (add manually with addOIDHandler()). */
 typedef struct RFC1213SystemStruct {
         char*           sysDescr;               /* .1.3.6.1.2.1.1.1.0   Read-only   */
-        char*           sysObjectID;            /* .1.3.6.1.2.1.1.2.0   Read-only   */
-        uint32_t        sysUpTime;              /* .1.3.6.1.2.1.1.3.0   Read-only   */
-        char*           sysContact;             /* .1.3.6.1.2.1.1.4.0   Read-only   */
-        char*           sysName;                /* .1.3.6.1.2.1.1.5.0   Read-only   */
+        char*           sysObjectID;            /* .1.3.6.1.2.1.1.2.0   Read-only (enterprise OID, user-owned) */
+        uint32_t        sysUpTime;              /* .1.3.6.1.2.1.1.3.0   Read-only (built-in dynamic by default) */
+        char*           sysContact;             /* .1.3.6.1.2.1.1.4.0   Read-Write  */
+        char*           sysName;                /* .1.3.6.1.2.1.1.5.0   Read-Write  */
         char*           sysLocation;            /* .1.3.6.1.2.1.1.6.0   Read-Write  */
         int32_t         sysServices;            /* .1.3.6.1.2.1.1.7.0   Read-only   */
     } RFC1213_list;

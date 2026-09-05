@@ -5,8 +5,6 @@
 #include "include/defs.h"
 #include "include/SNMPPacket.h"
 
-#include <stdlib.h>
-
 #ifdef COMPILING_TESTS
 	#include "tests/required/IPAddress.h"
 	#include "tests/required/UDP.h"
@@ -38,6 +36,11 @@ class SNMPTrap : public SNMPPacket {
     IPAddress agentIP;
     OIDType* trapOID = nullptr;
 
+    /* v3.3.4: trap sysUpTime resolution — defined in SNMPTrap.cpp (needs the
+     * complete SNMPAgent type). Order: sketch callback first (unchanged
+     * pre-3.3.4 behaviour), else the library built-in uptime, else nullptr
+     * (opt-out builds) which callers treat as 0 exactly as before. */
+    TimestampCallback* effectiveUptimeCallback();
     TimestampCallback* uptimeCallback = nullptr;
     short genericTrap = 6;
     short specificTrap = 1;
