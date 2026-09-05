@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: arduino/arduino-lint-action@v2
         with:
-          library-manager: submit  # NOT yet in Library Manager; flip to 'update' after the registry PR is accepted
+          library-manager: update  # in Library Manager since PR arduino/library-registry#9032; 'update' mode verifies the indexed name matches
           project-type: library
           compliance: specification
           recursive: true
