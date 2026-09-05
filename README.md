@@ -2,23 +2,13 @@
 
 **A memory-safe, deterministic-RAM SNMPv2c agent for Arduino — ESP32 & ESP8266 (proven on a 1 MB ESP8266).**
 
-## Current Version: 3.3.4
+## Current Version: 3.3.5
 
 > **Highlights:** compile-time **derived resource sizing** (packet budget → varbind cap → pool size; no magic numbers), **boot-time arena lock-in** (memory claimed before `setup()`/WiFi — immune to heap fragmentation), **stateless trap/inform sends** (no pool-backed state survives a transmit), **loud failure modes** (over-cap requests answer RFC 3416 `tooBig` instead of being silently dropped), and a **CI-validated test suite** (arduino-lint, host Catch2 tests, ESP8266 + ESP32 example compile matrix). See [Version History](#version-history) below.
 
-## Origin & Attribution
-
-SNMP_Embedded began as a fork of **Arduino_SNMP v2.1.0** by Aidan Cyr
-([0neblock/Arduino_SNMP](https://github.com/0neblock/Arduino_SNMP), last upstream release ~2022).
-
-Before being relaunched under its own name, the engine went through a hardware-validated
-reliability campaign — pool memory-safety, derived sizing, boot-time lock-in, and
-soak/flood testing on real ESP8266 hardware. The majority of the engine (~80% by measure)
-now differs from the 2021 original: the BER pool allocator, sizing model, trap/inform
-lifecycle, and the entire verification infrastructure are new, while the wire protocol
-work and the original architecture that made those improvements possible are inherited.
-
 **All development on SNMP_Embedded happens in this repository.**
+
+**Pull requests and issue reports are welcome.**
 
 ---
 
@@ -49,7 +39,7 @@ work and the original architecture that made those improvements possible are inh
   * Loud failure modes — over-cap GetBulk answers an RFC 3416 `tooBig` error PDU instead of silently truncating
   * Hardware-validated: ESP8266 30-minute soak campaigns, 0 pool alarms / 0 reboots / flat heap
 
-It was designed and tested around an ESP32, but will work with any Arduino-based device that has a UDP object available. Optimized for ESP8266 and other memory-constrained embedded targets — the library auto-tunes a reduced "TINY" profile on ESP8266 and was validated with 30+ minute soak and flood campaigns on a 1 MB ESP8266 board (flat heap, zero allocation failures, bounded deterministic RAM).
+It was designed, improved and tested around an ESP8266, but will work with any Arduino-based device that has a UDP object available. Optimized for ESP8266 and other memory-constrained embedded targets — the library auto-tunes a reduced "TINY" profile on ESP8266 and was validated with 30+ minute soak and flood campaigns on a 1 MB ESP8266 board (flat heap, zero allocation failures, bounded deterministic RAM).
 
 The example goes into detail around how to use, or look at `src/SNMP_Embedded.h` for the API.
 
@@ -362,7 +352,31 @@ There is currently no mechanism to know (with code) if an SNMP INFORM request ha
 
 ## Version History
 
-v3.3.3 is the initial baseline release of SNMP_Embedded. See the repository's commit
-history for changes since this baseline.
+- **v3.3.5** — Auto-size `addRFC1213SystemGroup()`: pass the buffer **arrays**
+  directly (five arguments, no `sizeof()`); capacity is deduced from the array
+  type, and a bare `char*` (unknown capacity) fails to compile. `RFC1213_SKIP`
+  marks a skipped OID in one self-documenting token. Over-long SETs still
+  answer `WRONG_LENGTH`; the v3.3.4 pointer+len form remains for heap- or
+  runtime-sized storage.
+- **v3.3.4** — One-call `addRFC1213SystemGroup()` helper (per-OID opt-out via
+  `nullptr`) plus a built-in, library-owned dynamic **sysUpTime** computed at
+  request time (opt out with `SNMP_NO_BUILTIN_SYSUPTIME`; feed your own clock
+  with `SNMPAgent::setUptimeSource()`). Trap timestamps resolve through the
+  same source, so GET uptime and trap sysUpTime can never disagree.
+- **v3.3.3** — Initial baseline release of SNMP_Embedded. See the repository's
+  commit history and [CHANGELOG.md](CHANGELOG.md) for the full line from the
+  2021 upstream original through the memory-safety campaign.
 
-Pull requests and issue reports are welcome.
+---
+
+## Origin & Attribution
+
+SNMP_Embedded began as a fork of **Arduino_SNMP v2.1.0** by Aidan Cyr
+([0neblock/Arduino_SNMP](https://github.com/0neblock/Arduino_SNMP), last upstream release ~2022).
+
+Before being relaunched under its own name, the engine went through a hardware-validated
+reliability campaign — pool memory-safety, derived sizing, boot-time lock-in, and
+soak/flood testing on real ESP8266 hardware. The majority of the engine (~80% by measure)
+now differs from the 2021 original: the BER pool allocator, sizing model, trap/inform
+lifecycle, and the entire verification infrastructure are new, while the wire protocol
+work and the original architecture that made those improvements possible are inherited.
