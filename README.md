@@ -346,7 +346,13 @@ if(snmp.sendTrapTo(testTrap, destinationIP, true, 2, 5000) != INVALID_SNMP_REQUE
 
 The `snmp.sendTrapTo()` values of `true, 2, 5000` indicate that if this is an INFORM request, it will try to send the INFORM up to 2 times, with a Timeout of 5000 milliseconds before it gives up, if it receives no response from the other end. The snmp.loop() will keep trying to resend the trap until the timeout or retry limit is reached.
 
-There is currently no mechanism to know (with code) if an SNMP INFORM request has been responded to. 
+Inform delivery **is** tracked: per RFC 3416, the receiving manager answers an
+InformRequest with a Response PDU, and the library matches that response (by
+request ID) inside `snmp.loop()` — dequeuing the pending inform on success and
+resending up to the configured retries on timeout (`sendTrapTo()`'s retry and
+timeout arguments). Note, however, that this acknowledgment state machine is
+internal: there is currently **no sketch-facing callback or query** to learn
+from user code whether a specific inform was acknowledged or timed out.
 
 ---
 
