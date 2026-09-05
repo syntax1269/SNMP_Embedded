@@ -148,6 +148,71 @@ RFC1213Config SNMPAgent::addRFC1213SystemGroup(
     return cfg;
 }
 
+RFC1213Config SNMPAgent::addRFC1213SystemGroupRaw(
+        const char* sysDescr,
+        char*       sysContact,    size_t contactLen,
+        char*       sysName,       size_t nameLen,
+        char*       sysLocation,   size_t locationLen,
+        int*        sysServices)
+{
+    RFC1213Config cfg;
+
+    if(sysDescr){
+        ValueCallback* cb = this->addReadOnlyStaticStringHandler(RFC1213_OID_sysDescr, sysDescr, true);
+        if(cb){ cfg.sysDescr = cb; cfg.registeredCount++; }
+        else { SNMP_LOGE("addRFC1213SystemGroup: sysDescr registration failed (duplicate OID? callbacks full?)\n"); }
+    }
+
+#if SNMP_HAS_BUILTIN_SYSUPTIME
+    /* Built-in dynamic uptime is registered in the constructor; nothing to do.
+     * cfg.sysUpTime stays nullptr by design — there is no user handle for it.
+     * Callers wanting a sketch-owned uptime define SNMP_NO_BUILTIN_SYSUPTIME
+     * and register it themselves. */
+    (void)0;
+#endif
+
+    if(sysContact){
+        if(contactLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysContact given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            SortableOIDType* oidType = this->buildOIDWithPrefix(RFC1213_OID_sysContact, true);
+            ValueCallback* cb = oidType ? this->addHandler(new StringBufCallback(oidType, sysContact, contactLen), true) : nullptr;
+            if(cb){ cfg.sysContact = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysContact registration failed\n"); }
+        }
+    }
+
+    if(sysName){
+        if(nameLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysName given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            SortableOIDType* oidType = this->buildOIDWithPrefix(RFC1213_OID_sysName, true);
+            ValueCallback* cb = oidType ? this->addHandler(new StringBufCallback(oidType, sysName, nameLen), true) : nullptr;
+            if(cb){ cfg.sysName = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysName registration failed\n"); }
+        }
+    }
+
+    if(sysLocation){
+        if(locationLen == 0){
+            SNMP_LOGE("addRFC1213SystemGroup: sysLocation given with len=0 - NOT registered. Pass sizeof(buffer).\n");
+        } else {
+            SortableOIDType* oidType = this->buildOIDWithPrefix(RFC1213_OID_sysLocation, true);
+            ValueCallback* cb = oidType ? this->addHandler(new StringBufCallback(oidType, sysLocation, locationLen), true) : nullptr;
+            if(cb){ cfg.sysLocation = cb; cfg.registeredCount++; }
+            else { SNMP_LOGE("addRFC1213SystemGroup: sysLocation registration failed\n"); }
+        }
+    }
+
+    if(sysServices){
+        ValueCallback* cb = this->addIntegerHandler(RFC1213_OID_sysServices, sysServices, false, true);
+        if(cb){ cfg.sysServices = cb; cfg.registeredCount++; }
+        else { SNMP_LOGE("addRFC1213SystemGroup: sysServices registration failed\n"); }
+    }
+
+    return cfg;
+}
+
 void SNMPAgent::setUDP(UDP* udp){
     if(this->udpCount >= SNMP_MAX_UDP_PER_AGENT){
         SNMP_LOGE("setUDP: _udp[] full (%d slots). Raise SNMP_MAX_UDP_PER_AGENT.\n", SNMP_MAX_UDP_PER_AGENT);

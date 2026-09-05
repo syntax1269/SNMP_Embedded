@@ -46,7 +46,6 @@ static uint32_t counter32 = 0;
 /* RFC1213 system group buffers (sparse selection — see setup()). */
 static char sysDescrBuf[64]   = "ESP32 minimal demo (SNMP_Embedded)";
 static char sysContactBuf[64] = "ops@example.com";
-static char* sysContactPtr = sysContactBuf;
 
 static uint32_t getUptimeSeconds(void) { return (uint32_t)(millis() / 1000U); }
 
@@ -75,11 +74,12 @@ void setup()
     // library automatically and computed at request time, so it is current
     // even right after a loop() stall. Check it twice a second apart:
     //   snmpget -v 2c -c public <ip> .1.3.6.1.2.1.1.3.0
+    // v3.3.5: pass the BUFFER ARRAY — capacity is deduced, no sizeof() needed.
     agent.addRFC1213SystemGroup(
         sysDescrBuf,                           // sysDescr (read-only static string)
-        &sysContactPtr, sizeof(sysContactBuf), // sysContact (read-write)
-        nullptr, 0,                            // sysName     — not configured
-        nullptr, 0,                            // sysLocation — not configured
+        sysContactBuf,                         // sysContact (read-write, size deduced)
+        RFC1213_SKIP,                          // sysName     — not configured
+        RFC1213_SKIP,                          // sysLocation — not configured
         nullptr);                              // sysServices — not configured
 
     // Three representative custom handlers (integer / static string / dynamic timestamp).

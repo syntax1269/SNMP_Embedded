@@ -95,6 +95,7 @@ void setup(){
     // noSuchName (v1) / noSuchObject (v2c), and the BUILT-IN sysUpTime
     // (.1.3.6.1.2.1.1.3.0, registered by the library automatically) is always
     // live. Query it with:  snmpget -v 2c -c public <IP> .1.3.6.1.2.1.1.3.0
+    // v3.3.5: passing only sysDescr = the one-argument form; no sizeof() anywhere.
     snprintf(sysDescrBuf, sizeof(sysDescrBuf), "ESP32_SNMP demo (SNMP_Embedded v%s)", snmp.getVersion());
     snmp.addRFC1213SystemGroup(sysDescrBuf);
 

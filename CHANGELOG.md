@@ -1,5 +1,41 @@
 # Changelog — SNMP_Embedded
 
+## v3.3.5 — Auto-size RFC1213 helper: pass the buffer, not the sizeof
+
+**Additive API polish. The v3.3.4 pointer+len form remains valid; no breaking changes.**
+
+### Added
+
+- **Auto-size overloads for `addRFC1213SystemGroup()`** — pass the RW string
+  **arrays** directly (`sysContactBuf`, not `&sysContactPtr, sizeof(buf)`); the
+  library deduces each capacity from the array type. The call drops from 8
+  arguments to 5 and no `sizeof()` trivia:
+  `snmp.addRFC1213SystemGroup(sysDescr, sysContactBuf, sysNameBuf, sysLocBuf, &sysServices);`
+- **`RFC1213_SKIP` sentinel** — skip an OID in the auto-size form by placing the
+  sentinel in its slot (`RFC1213_SKIP` instead of an array). Replaces the
+  pointer form's `nullptr, 0` pair with a single self-documenting token.
+- **`StringBufCallback`** — array-backed RW string handler binding the `char[]`
+  buffer directly; semantics identical to `StringCallback` (GET serves buffer
+  contents, SET `strncpy`s bounded by the deduced capacity, over-long SETs
+  answer `WRONG_LENGTH`). Zero allocation.
+- **Type-safety by construction**: `SysBuf` accepts real arrays or `RFC1213_SKIP`
+  and *not* bare `char*` — a pointer with unknown capacity fails to compile
+  rather than guessing. The advanced pointer+len overload remains for heap or
+  runtime-sized storage.
+
+### Changed
+
+- All five sketches/examples updated to teach the auto-size form (the teaching
+  matrix now shows auto-size, SKIP, and the side-by-side pointer form in
+  `SNMP_Sensor`).
+- Host suite grows to **243 assertions / 22 test cases**: auto-size GET/SET
+  round-trip, SKIP semantics, deduced-capacity overflow refusal, and pointer-
+  form interop. Opt-out profile unchanged (175 / 17, both exit 0).
+- Compile matrix re-verified 8/8 (2 examples × 2 platforms + 2 CLI demos +
+  PlatformIO minimal × 2 envs). Hardware re-verified on ESP8266: clean boot,
+  1-minute flood soak (104 ops, 0 pool alarms, 0 crashes, 1 WiFi transport
+  timeout).
+
 ## v3.3.4 — RFC1213 system group: one-call helper + built-in dynamic sysUpTime
 
 **Additive feature release. No breaking API changes. One documented behavioural delta (below).**

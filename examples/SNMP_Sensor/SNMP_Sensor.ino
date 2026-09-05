@@ -360,21 +360,26 @@ bool saveSNMPValues()
 
 void addRFC1213MIBHandler()
 {
-    // v3.3.4: one call registers the six configurable RFC1213 system OIDs.
+    // v3.3.5: one call registers the six configurable RFC1213 system OIDs.
     // sysUpTime is NOT in the list — the library already serves it live
     // (computed at request time). sysObjectID is NOT covered by the helper:
     // it is the enterprise OID, added manually below.
     //
-    // Pass only what you want; each registered OID = 1 pool slot + its buffer.
-    // RW strings REQUIRE the buffer length (sizeof) so SETs cannot overflow,
-    // and the same length is used when restoring values from persistent
-    // storage via strlcpy().
+    // Pass the BUFFER ARRAYS directly — the library deduces each capacity,
+    // so SETs can never overflow and there is no sizeof() to type. Skip an
+    // OID with RFC1213_SKIP in its slot. Each registered OID = 1 pool slot.
+    // (The sketch keeps its own char* pointers for strlcpy() restores from
+    // persistent storage; the library binds the arrays themselves.)
     snmp.addRFC1213SystemGroup(
-        sysDescr,                                // sysDescr  (read-only static string)
-        &sysContact,  sizeof(sysContactValue),   // sysContact  (read-write, 64 B)
-        &sysName,     sizeof(sysNameValue),      // sysName     (read-write, 64 B)
-        &sysLocation, sizeof(sysLocationValue),  // sysLocation (read-write, 64 B)
-        &sysServices);                           // sysServices (read-only integer)
+        sysDescr,            // sysDescr  (read-only static string)
+        sysContactValue,     // sysContact  (read-write, 64 B — size deduced)
+        RFC1213_SKIP,        // sysName     skipped: not served by this agent
+        sysLocationValue,    // sysLocation (read-write, 64 B — size deduced)
+        &sysServices);       // sysServices (read-only integer)
+
+    // sysName served manually instead — same OID, pointer+len form, showing
+    // both API styles working side by side:
+    snmp.addReadWriteStringHandler(".1.3.6.1.2.1.1.5.0", &sysName, sizeof(sysNameValue), true, true);
 
     // The one OID the helper deliberately does not own: your enterprise OID.
     snmp.addOIDHandler(oidSysObjectID, sysObjectID);

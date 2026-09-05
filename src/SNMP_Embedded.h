@@ -142,6 +142,57 @@ class SNMPAgent {
             char**      sysLocation  = nullptr, size_t locationLen = 0,  /* RW */
             int*         sysServices  = nullptr);                      /* RO; typical 72 (IP+TCP host), 64 (L3), 0 (endpoint) */
 
+        /* ---- v3.3.5: auto-sizing overloads — pass the ARRAY, not &ptr+sizeof ----
+         * The library deduces each RW buffer's capacity from the array type, so
+         * the five-input call has zero sizeof() trivia:
+         *   snmp.addRFC1213SystemGroup(descr, sysContactBuf, sysNameBuf, sysLocBuf, &sysServices);
+         * Skip an OID with RFC1213_SKIP in its slot:
+         *   snmp.addRFC1213SystemGroup(descr, RFC1213_SKIP, sysNameBuf, RFC1213_SKIP, &sysServices);
+         * The buffer must be a real char array (char buf[64]) — a bare char* has no
+         * deducible capacity and fails to compile rather than guessing. For heap or
+         * runtime-sized storage, use the (char**, size_t) pointer form above.
+         * sysDescr stays read-only: no length needed, the library never writes it. */
+        struct Skip_t { Skip_t() = default; };            /* sentinel type; use RFC1213_SKIP */
+
+        /* A read-write string buffer the library can size by itself. Constructed
+         * from a real char array (char buf[64]) or from RFC1213_SKIP (= "not
+         * configured"); NOT constructible from a bare char* (capacity unknown
+         * -> compile error). Zero allocation: it only carries (char* data, len)
+         * to a dedicated array-backed callback. */
+        struct SysBuf {
+            char*    data;
+            size_t   len;
+            SysBuf() = delete;                          /* no accidental empty */
+            SysBuf(Skip_t) : data(nullptr), len(0) {}   /* RFC1213_SKIP -> skip this OID */
+            template <size_t N>
+            SysBuf(char* (&buf)[N]) : data(buf), len(N) {}  /* char* name[64] */
+            template <size_t N>
+            SysBuf(char (&buf)[N])  : data(buf), len(N) {}  /* char name[64] (direct array) */
+        };
+
+        /* AUTO-SIZE form: real arrays for the three RW strings — five inputs, no sizeof(). */
+        RFC1213Config addRFC1213SystemGroup(
+            const char*         sysDescr,
+            SysBuf              sysContact,
+            SysBuf              sysName,
+            SysBuf              sysLocation,
+            int*                sysServices)
+        {
+            return addRFC1213SystemGroupRaw(sysDescr,
+                                         sysContact.data, sysContact.len,
+                                         sysName.data,    sysName.len,
+                                         sysLocation.data,sysLocation.len,
+                                         sysServices);
+        }
+
+        /* Internal: array-backed RW string registration (SysBuf core). */
+        RFC1213Config addRFC1213SystemGroupRaw(
+            const char* sysDescr,
+            char*       sysContact,    size_t contactLen,
+            char*       sysName,       size_t nameLen,
+            char*       sysLocation,   size_t locationLen,
+            int*        sysServices);
+
         /* Override the uptime clock source (ms). Default: millis(). Mostly for
          * tests (fake clock); usable for custom tick sources on hardware. */
         static void setUptimeSource(unsigned long (*source)());
@@ -261,5 +312,11 @@ class SNMPAgent {
         struct InformItem* informList[SNMP_MAX_TRAPS_INFLIGHT] = {nullptr};
         int informCount = 0;
 };
+
+/* v3.3.5: sentinel for addRFC1213SystemGroup()'s auto-size form — "skip this
+ * OID". Declared after the class (the type is SNMPAgent::Skip_t); C++11 keeps
+ * the aggregate initialization a compile-time constant, so it works in any
+ * call site, including sketches. */
+static const SNMPAgent::Skip_t RFC1213_SKIP = SNMPAgent::Skip_t();
 
 #endif

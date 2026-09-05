@@ -154,6 +154,23 @@ SNMP_ERROR_STATUS StringCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
+std::shared_ptr<BER_CONTAINER> StringBufCallback::buildTypeWithValue(){
+    ASSERT_VALID_VALUE(this->value);
+
+    return pool_shared(asn_new<OctetType>(this->value));
+}
+
+SNMP_ERROR_STATUS StringBufCallback::setTypeWithValue(BER_CONTAINER* rawValue){
+    ASSERT_CALLBACK_SETTABLE();
+    ASSERT_VALID_SETTABLE_VALUE(this->value);
+
+    OctetType* val = static_cast<OctetType*>(rawValue);
+    if(val->_valueLen >= this->max_len) return WRONG_LENGTH;
+    strncpy(this->value, val->_value, this->max_len);
+
+    return NO_ERROR;
+}
+
 std::shared_ptr<BER_CONTAINER> ReadOnlyStringCallback::buildTypeWithValue(){
     return pool_shared(asn_new<OctetType>(this->value));
 }

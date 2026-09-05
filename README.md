@@ -236,30 +236,35 @@ Everything else in the group is yours to choose. Register any subset with
 one call:
 
 ```
-// all six configurable OIDs
+// v3.3.5 auto-size form: pass the BUFFER ARRAYS — the library deduces each
+// capacity, so SETs can never overflow and there is no sizeof() to type.
 char sysContactBuf[64], sysNameBuf[64], sysLocBuf[64];
-char* sysContact = sysContactBuf; char* sysName = sysNameBuf; char* sysLoc = sysLocBuf;
 int sysServices = 72;  /* int (not int32_t): on ESP32 int32_t is 'long' and won't match */
 snmp.addRFC1213SystemGroup(sysDescr,
-    &sysContact, sizeof(sysContactBuf),
-    &sysName,    sizeof(sysNameBuf),
-    &sysLoc,     sizeof(sysLocBuf),
-    &sysServices);
+    sysContactBuf,            // read-write, capacity deduced from the array
+    sysNameBuf,               // read-write, capacity deduced
+    sysLocBuf,                // read-write, capacity deduced
+    &sysServices);            // read-only integer
 
-// just three — unlisted OIDs are simply not registered
+// skip any OID with RFC1213_SKIP in its slot — here only sysName + sysLocation exist:
 snmp.addRFC1213SystemGroup(sysDescr,
-    nullptr, 0,
-    &sysName, sizeof(sysNameBuf),
-    &sysLoc,  sizeof(sysLocBuf));
+    RFC1213_SKIP,             // sysContact — not served by this agent
+    sysNameBuf,
+    sysLocBuf,
+    nullptr);                 // sysServices — not served
 ```
 
 Notes:
 
+- The auto-size buffers must be real arrays (`char buf[64]`); a bare `char*`
+  has no deducible capacity and fails to compile rather than guessing. For
+  heap or runtime-sized storage, the advanced pointer form remains:
+  `snmp.addRFC1213SystemGroup(sysDescr, &ptr, sizeof(buf), ...)`.
 - Each registered OID costs exactly one pool slot plus its string buffer.
   OIDs you skip cost nothing. GETs on skipped OIDs return the standard
   no-such-object response; walks bridge the gaps cleanly.
-- Read-write strings REQUIRE the buffer length (`sizeof(buf)`) so SET
-  requests can never overflow your storage.
+- Read-write strings can never overflow: the deduced (or supplied) buffer
+  length bounds every SET.
 - `sysObjectID` is deliberately not covered by the helper: it is your
   enterprise OID. Add it manually when you want it:
   `snmp.addOIDHandler(RFC1213_OID_sysObjectID, "1.3.6.1.4.1.99999");`

@@ -173,6 +173,23 @@ class StringCallback: public ValueCallback {
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
+/* v3.3.5: array-backed RW string — binds the char[] buffer DIRECTLY (no char*
+ * pointer variable needed), so addRFC1213SystemGroup's auto-size form can serve
+ * "pass the array, the library sizes it" with zero user sizeof() trivia.
+ * Semantics identical to StringCallback: GET serves *the buffer contents,
+ * SET strncpy's into it, bounded by max_len (the deduced array capacity). */
+class StringBufCallback: public ValueCallback {
+  public:
+    StringBufCallback(SortableOIDType* oid, char* value, size_t max_len): ValueCallback(oid, STRING), value(value), max_len(max_len) {}
+
+  protected:
+    char* const  value;
+    size_t const max_len;
+
+    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
+};
+
 class OpaqueCallback: public ValueCallback {
   public:
     OpaqueCallback(SortableOIDType* oid, uint8_t* value, int data_len): ValueCallback(oid, OPAQUE), value(value), data_len(data_len) {}

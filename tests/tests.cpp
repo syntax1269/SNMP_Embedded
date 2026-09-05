@@ -1145,4 +1145,97 @@ TEST_CASE( "v3.3.4 trap timestamp: built-in uptime supplies live sysUpTime, mono
     REQUIRE( ASNPool::usedCount >= 1 );   /* the built-in handler's slot */
 }
 
+
+/* ---- v3.3.5: auto-size SysBuf helper — array registration, SKIP sentinel, SET path ---- */
+TEST_CASE( "v3.3.5 helper: auto-size arrays register without sizeof(); SKIP omits; SET writes the buffer", "[snmp][v335]" ){
+    test_tick_reset();
+    ASNPool::resetAll();
+    SNMPAgent::setUptimeSource(&fake_millis);
+    int baseAlarms = ASNPool::doubleReleaseAlarms;
+
+    {
+        SNMPAgent agent((char*)"public", (char*)"private");
+        int afterCtor = agent.testCallbacksCount();
+
+        static char descrBuf[64];
+        static char contactBuf[64], locBuf[48];
+        static char nameBuf[32]; (void)nameBuf;   /* kept for the SKIP-doc example */
+        static int  svc = 72;
+        strcpy(descrBuf, "autosize agent");
+
+        /* five inputs, no sizeof(), one OID skipped via RFC1213_SKIP */
+        RFC1213Config cfg = agent.addRFC1213SystemGroup(
+            descrBuf, contactBuf, RFC1213_SKIP, locBuf, &svc);
+        REQUIRE( cfg.registeredCount == 4 );        /* descr + contact + loc + svc (name skipped) */
+        REQUIRE( cfg.sysName == nullptr );          /* skipped OID left unregistered            */
+        REQUIRE( cfg.sysContact != nullptr );
+        REQUIRE( cfg.sysLocation != nullptr );
+        REQUIRE( agent.testCallbacksCount() == afterCtor + 4 );
+
+        /* GET through the SysBuf-backed handler serves the buffer contents */
+        SNMPPacket* resp = nullptr;
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.1.0", &resp) );   /* sysDescr */
+        REQUIRE( strcmp(static_cast<OctetType*>(resp->varbindList[0].value)->_value, "autosize agent") == 0 );
+        delete resp;
+
+        REQUIRE( runGet(&agent, ".1.3.6.1.2.1.1.6.0", &resp) );   /* sysLocation (empty buffer) */
+        REQUIRE( static_cast<OctetType*>(resp->varbindList[0].value)->_valueLen == 0 );
+        delete resp;
+
+        /* SET writes into the char[] buffer directly (StringBufCallback path) */
+        {
+            SNMPPacket* req = new SNMPPacket();
+            req->setPDUType(SetRequestPDU);
+            req->setCommunityString("public");   /* "public" = RW community in this harness */
+            req->setRequestID(random());
+            req->setVersion(SNMP_VERSION_1);
+            req->push_back(VarBind(std::make_shared<SortableOIDType>(".1.3.6.1.2.1.1.6.0"),
+                                   std::make_shared<OctetType>("rack B, shelf 3")));
+            uint8_t buffer[400];
+            int buf_len = req->serialiseInto(buffer, 400);
+            delete req;
+            REQUIRE( buf_len > 0 );
+            int responseLength = 0;
+            REQUIRE( handlePacket(buffer, buf_len, &responseLength, 400,
+                                  agent.testCallbacks(), agent.testCallbacksCount(),
+                                  (char*)"public", (char*)"private") == SNMP_SET_OCCURRED );
+            SNMPPacket* setResp = new SNMPPacket();
+            REQUIRE( setResp->parseFrom(buffer, responseLength) == SNMP_ERROR_OK );
+            delete setResp;
+        }
+        REQUIRE( strcmp(locBuf, "rack B, shelf 3") == 0 );   /* bytes landed in the array */
+
+        /* the deduced capacity is the real array size: an over-long SET is refused */
+        {
+            SNMPPacket* req = new SNMPPacket();
+            req->setPDUType(SetRequestPDU);
+            req->setCommunityString("public");
+            req->setRequestID(random());
+            req->setVersion(SNMP_VERSION_1);
+            char big[96]; memset(big, 'x', sizeof(big) - 1); big[sizeof(big)-1] = 0;
+            req->push_back(VarBind(std::make_shared<SortableOIDType>(".1.3.6.1.2.1.1.6.0"),
+                                   std::make_shared<OctetType>(big, sizeof(big) - 1)));
+            uint8_t buffer[400];
+            int buf_len = req->serialiseInto(buffer, 400);
+            delete req;
+            REQUIRE( buf_len > 0 );
+            int responseLength = 0;
+            (void)handlePacket(buffer, buf_len, &responseLength, 400,
+                               agent.testCallbacks(), agent.testCallbacksCount(),
+                               (char*)"public", (char*)"private");
+            /* WRONG_LENGTH response — buffer beyond deduced 48-byte capacity untouched */
+            REQUIRE( strncmp(locBuf, "rack B, shelf 3", 15) == 0 );
+        }
+
+        /* advanced pointer+len overload still works alongside */
+        static char heapLike[24]; char* p = heapLike;
+        cfg = agent.addRFC1213SystemGroup(nullptr, &p, sizeof(heapLike), nullptr, 0, nullptr, 0, nullptr);
+        REQUIRE( cfg.registeredCount == 1 );
+        REQUIRE( cfg.sysContact != nullptr );
+
+        agent.testReleaseFromRegistry();
+    }
+    REQUIRE( SNMPAgent::testAgentsCount() == 0 );
+    REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
+}
 #endif /* SNMP_HAS_BUILTIN_SYSUPTIME */
