@@ -46,6 +46,14 @@ static bool pred_match_request_id(struct InformItem* item, void* ctx){
     return item->requestID == c->id;
 }
 
+/* v3.3.6: predicate helper backing inform_pending_with_id(). */
+bool inform_pending_with_id(struct InformItem **informList, int informCount, snmp_request_id_t requestID){
+    for(int i = 0; i < informCount; i++){
+        if(informList[i] && informList[i]->requestID == requestID) return true;
+    }
+    return false;
+}
+
 static bool pred_done_or_orphan(struct InformItem* item, void*){
     return item->received || (item->retries == 0 && item->missed);
 }

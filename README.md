@@ -2,7 +2,7 @@
 
 **A memory-safe, deterministic-RAM SNMPv2c agent for Arduino — ESP32 & ESP8266 (proven on a 1 MB ESP8266).**
 
-## Current Version: 3.3.5
+## Current Version: 3.3.6
 
 > **Highlights:** compile-time **derived resource sizing** (packet budget → varbind cap → pool size; no magic numbers), **boot-time arena lock-in** (memory claimed before `setup()`/WiFi — immune to heap fragmentation), **stateless trap/inform sends** (no pool-backed state survives a transmit), **loud failure modes** (over-cap requests answer RFC 3416 `tooBig` instead of being silently dropped), and a **CI-validated test suite** (arduino-lint, host Catch2 tests, ESP8266 + ESP32 example compile matrix). See [Version History](#version-history) below.
 
@@ -350,9 +350,29 @@ Inform delivery **is** tracked: per RFC 3416, the receiving manager answers an
 InformRequest with a Response PDU, and the library matches that response (by
 request ID) inside `snmp.loop()` — dequeuing the pending inform on success and
 resending up to the configured retries on timeout (`sendTrapTo()`'s retry and
-timeout arguments). Note, however, that this acknowledgment state machine is
-internal: there is currently **no sketch-facing callback or query** to learn
-from user code whether a specific inform was acknowledged or timed out.
+timeout arguments).
+
+Since **v3.3.6** the acknowledgment is also available to your sketch — install
+a callback and it fires once per matched Response PDU, from inside
+`snmp.loop()` (never an ISR), with the inform's request ID and the responder's
+outcome (`true` = the manager processed it with `noError`; `false` = it
+responded with an error — rejected, not lost). The callback only fires for
+request IDs that actually have a pending inform, so unsolicited Response PDUs
+never produce phantom confirmations. Pass `nullptr` to uninstall:
+
+```
+void onInformAck(unsigned long requestID, bool success) {
+    Serial.printf("Inform %lu: %s\r\n", requestID,
+                  success ? "ACKED by manager" : "REJECTED (error response)");
+}
+
+// in setup(), before sending:
+snmp.setInformAckCallback(onInformAck);
+```
+
+Informs that exhaust their retries with no response do **not** fire the ack
+callback (no answer ever arrived); the queue item is simply retired and the
+inform stops being resent.
 
 ---
 

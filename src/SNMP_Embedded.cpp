@@ -493,6 +493,13 @@ void SNMPAgent::informCallback(void* ctx, snmp_request_id_t requestID, bool resp
     if(!ctx) return;
     SNMPAgent* agent = static_cast<SNMPAgent*>(ctx);
 
+    /* v3.3.6: surface the ack to the sketch BEFORE the queue item is removed —
+     * only when a pending inform with this request ID actually existed, so
+     * unsolicited Response PDUs never produce phantom confirmations. */
+    if(agent->_informAckCb && inform_pending_with_id(agent->informList, agent->informCount, requestID)){
+        agent->_informAckCb(requestID, responseReceiveSuccess);
+    }
+
     return inform_callback(agent->informList, agent->informCount, requestID, responseReceiveSuccess);
 }
 

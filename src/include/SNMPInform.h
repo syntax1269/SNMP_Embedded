@@ -22,6 +22,8 @@ struct InformItem {
 
 snmp_request_id_t queue_and_send_trap(struct InformItem **informList, int& informCount, SNMPTrap* trap, const IPAddress& ip, bool replaceQueuedRequests, int retries, int delay_ms);
 void inform_callback(struct InformItem **informList, int& informCount, snmp_request_id_t requestID, bool responseReceiveSuccess);
+/* v3.3.6: true if a still-pending inform with this request ID is queued. */
+bool inform_pending_with_id(struct InformItem **informList, int informCount, snmp_request_id_t requestID);
 void handle_inform_queue(struct InformItem **informList, int& informCount);
 void mark_trap_deleted(struct InformItem **informList, int& informCount, SNMPTrap* trap);
 #endif

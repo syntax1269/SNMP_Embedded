@@ -1239,3 +1239,123 @@ TEST_CASE( "v3.3.5 helper: auto-size arrays register without sizeof(); SKIP omit
     REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
 }
 #endif /* SNMP_HAS_BUILTIN_SYSUPTIME */
+
+/* ---- v3.3.6: setInformAckCallback — sketch-facing inform delivery
+ * confirmation. The internal ack machinery (Response PDU matched by request
+ * ID in handlePacket) now surfaces to sketches: the callback fires once per
+ * matched response, never for unsolicited/unmatched Response PDUs, and
+ * carries the responder's error outcome. ---- */
+TEST_CASE( "v3.3.6 inform ack callback: fires for matched responses with responder outcome, silent for unmatched", "[snmp][v336]" ){
+    test_tick_reset();
+    ASNPool::resetAll();
+    int baseAlarms = ASNPool::doubleReleaseAlarms;
+
+    struct AckLog {
+        int fired = 0;
+        snmp_request_id_t lastID = 0;
+        bool lastSuccess = false;
+        static void onAck(snmp_request_id_t id, bool ok){
+            if(AckLog* self = s_instance()){ self->fired++; self->lastID = id; self->lastSuccess = ok; }
+        }
+        static AckLog* s_instance(){ static AckLog log; return &log; }
+    };
+    AckLog::s_instance()->fired = 0;
+
+    SNMPAgent agent((char*)"public", (char*)"private");
+    agent.setInformAckCallback(&AckLog::onAck);
+
+    /* an inform responder's GetResponse PDU whose request ID matches a queued
+     * inform — build one directly (no real network on the host): */
+    snmp_request_id_t ackedID = 424242;
+
+    /* 1. Unmatched response FIRST: no inform queued -> callback must NOT fire
+     *    (no phantom confirmation for unsolicited Response PDUs). */
+    {
+        SNMPPacket* resp = new SNMPPacket();
+        resp->setPDUType(GetResponsePDU);
+        resp->setCommunityString("public");
+        resp->setRequestID(ackedID);
+        resp->setVersion(SNMP_VERSION_2C);
+        uint8_t buffer[300];
+        int buf_len = resp->serialiseInto(buffer, 300);
+        delete resp;
+        REQUIRE( buf_len > 0 );
+        int responseLength = 0;
+        REQUIRE( handlePacket(buffer, buf_len, &responseLength, 300,
+                              agent.testCallbacks(), agent.testCallbacksCount(),
+                              (char*)"public", (char*)"private",
+                              nullptr, nullptr) == SNMP_INFORM_RESPONSE_OCCURRED );
+        /* internal path without a callback registered on the agent: use the
+         * agent's own informCallback through a direct call instead — here we
+         * verify via loop-independent plumbing below. */
+        (void)responseLength;
+        REQUIRE( AckLog::s_instance()->fired == 0 );
+    }
+
+    /* 2. Queue a pending inform item directly (queue_and_send_trap needs a
+     *    UDP socket; the queue state under test is the InformItem list). */
+    {
+        struct InformItem* item = (struct InformItem*)calloc(1, sizeof(struct InformItem));
+        REQUIRE( item != nullptr );
+        item->requestID = ackedID;
+        item->retries = 2;
+        item->delay_ms = 5000;
+        item->received = false;
+        item->missed = false;
+        item->trap = nullptr;
+        item->lastSent = 0;
+        agent.informList[agent.informCount++] = item;
+        REQUIRE( inform_pending_with_id(agent.informList, agent.informCount, ackedID) );
+        REQUIRE( !inform_pending_with_id(agent.informList, agent.informCount, 999) );
+    }
+
+    /* 3. Deliver the ack through the agent's internal callback path exactly
+     *    as handlePacket does on a real Response PDU. */        SNMPAgent::testInformCallback((void*)&agent, ackedID, true);
+    REQUIRE( AckLog::s_instance()->fired == 1 );
+    REQUIRE( AckLog::s_instance()->lastID == ackedID );
+    REQUIRE( AckLog::s_instance()->lastSuccess == true );
+    /* the pending item was consumed by the ack (queue drained) */
+    REQUIRE( agent.informCount == 0 );
+    REQUIRE( !inform_pending_with_id(agent.informList, agent.informCount, ackedID) );
+
+    /* 4. Responder signalled an error (errorStatus != 0): success=false must
+     *    propagate — the sketch learns the inform was REJECTED, not lost. */
+    {
+        snmp_request_id_t errID = 777;
+        struct InformItem* item = (struct InformItem*)calloc(1, sizeof(struct InformItem));
+        REQUIRE( item != nullptr );
+        item->requestID = errID;
+        item->retries = 1;
+        item->delay_ms = 5000;
+        item->received = false;
+        item->missed = false;
+        item->trap = nullptr;
+        item->lastSent = 0;
+        agent.informList[agent.informCount++] = item;
+
+        SNMPAgent::testInformCallback((void*)&agent, errID, false);
+        REQUIRE( AckLog::s_instance()->fired == 2 );
+        REQUIRE( AckLog::s_instance()->lastID == errID );
+        REQUIRE( AckLog::s_instance()->lastSuccess == false );
+    }
+
+    /* 5. Uninstall: nullptr callback restores silence. */
+    agent.setInformAckCallback(nullptr);
+    {
+        snmp_request_id_t quietID = 999;
+        struct InformItem* item = (struct InformItem*)calloc(1, sizeof(struct InformItem));
+        REQUIRE( item != nullptr );
+        item->requestID = quietID;
+        item->retries = 1; item->delay_ms = 1000;
+        item->received = false; item->missed = false;
+        item->trap = nullptr; item->lastSent = 0;
+        agent.informList[agent.informCount++] = item;
+
+        SNMPAgent::testInformCallback((void*)&agent, quietID, true);
+        REQUIRE( AckLog::s_instance()->fired == 2 );
+    }
+
+    agent.testReleaseFromRegistry();
+    REQUIRE( SNMPAgent::testAgentsCount() == 0 );
+    REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
+}

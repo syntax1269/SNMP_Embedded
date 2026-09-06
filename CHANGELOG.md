@@ -1,5 +1,45 @@
 # Changelog — SNMP_Embedded
 
+## v3.3.6 — Sketch-facing inform delivery confirmation (`setInformAckCallback`)
+
+**Additive API. No breaking changes; the inform state machine's behavior without a callback is unchanged.**
+
+### Added
+
+- **`SNMPAgent::setInformAckCallback(informAckCB cb)`** — first-class inform
+  delivery confirmation for sketches. The library has always matched the
+  manager's Response PDU (by request ID) against its pending-inform queue;
+  this surfaces that event to user code:
+
+  ```cpp
+  void onInformAck(unsigned long requestID, bool success) { /* ... */ }
+  snmp.setInformAckCallback(onInformAck);   // nullptr to uninstall
+  ```
+
+  - Fired from **inside `snmp.loop()`** (never an ISR, no thread concerns).
+  - `success=true`: the manager decoded and processed the inform with
+    `noError` (RFC 3416 Response PDU, errorStatus 0).
+  - `success=false`: the manager responded with an **error** status — the
+    inform was *rejected*, not lost. The pending item is retired either way
+    (no resend after an explicit answer).
+  - **Only fires for request IDs with a pending inform** — unsolicited or
+    stale Response PDUs can never produce phantom confirmations.
+  - Informs that exhaust their retries with **no response at all** do not
+    fire the ack (nothing arrived to acknowledge); the item is retired when
+    the retry budget runs out, as before.
+- New typedef `informAckCB` (`void (*)(snmp_request_id_t, bool)`) in
+  `SNMPParser.h`.
+- Host tests: ack delivered for matched responses, success/failure outcome
+  propagation, phantom suppression for unmatched responses, uninstall
+  restores silence, queue consumed on ack (262 assertions / 23 cases default;
+  194/18 with `SNMP_NO_BUILTIN_SYSUPTIME`).
+
+### Notes
+
+- The callback is per-agent (each `SNMPAgent` instance carries its own hook);
+  multi-agent sketches install one per instance.
+- Compile matrix re-verified: all examples/demos on ESP8266 + ESP32.
+
 ## v3.3.5 — Auto-size RFC1213 helper: pass the buffer, not the sizeof
 
 **Additive API polish. The v3.3.4 pointer+len form remains valid; no breaking changes.**

@@ -263,10 +263,20 @@ class SNMPAgent {
             }
         }
         static int testAgentsCount(){ return agentsCount; }
+        /* Drive the internal inform-ack path directly (v3.3.6 test hook). */
+        static void testInformCallback(void* ctx, snmp_request_id_t id, bool ok){ informCallback(ctx, id, ok); }
 #endif
 
         snmp_request_id_t sendTrapTo(SNMPTrap* trap, const IPAddress& ip, bool replaceQueuedRequests = true, int retries = 0, int delay_ms = 30000);
         static void markTrapDeleted(SNMPTrap* trap);
+
+        /* v3.3.6: sketch-facing inform delivery confirmation. The callback is
+         * invoked from snmp.loop() (never from an ISR or another thread) once
+         * per matched Response PDU, with the inform's request ID and the
+         * responder's outcome (true = noError). Pass nullptr to uninstall.
+         * A timed-out, exhausted-retries inform does NOT fire this callback —
+         * see setInformTimeoutCallback() for that event. */
+        void setInformAckCallback(informAckCB cb){ _informAckCb = cb; }
 
     private:
         ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
@@ -287,6 +297,9 @@ class SNMPAgent {
 
         /* SNMPTrap resolves its timestamp source to the built-in mirror. */
         friend class SNMPTrap;
+
+        /* v3.3.6: sketch-facing inform-ack hook (nullptr = none installed). */
+        informAckCB _informAckCb = nullptr;
 
         static void informCallback(void*, snmp_request_id_t, bool);
         void handleInformQueue();
