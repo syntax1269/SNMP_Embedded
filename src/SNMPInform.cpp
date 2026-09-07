@@ -1,3 +1,4 @@
+#if !SNMP_NO_TRAPS
 #include "include/SNMPInform.h"
 #include "SNMPTrap.h"
 
@@ -150,3 +151,4 @@ void mark_trap_deleted(struct InformItem **informList, int& informCount, SNMPTra
     QSt_match_trap ctx{trap};
     remove_informs_matching(informList, informCount, pred_match_trap, &ctx);
 }
+#endif /* !SNMP_NO_TRAPS */

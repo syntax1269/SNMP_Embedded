@@ -1,3 +1,4 @@
+#if !SNMP_NO_TRAPS
 #include "SNMPTrap.h"
 #include "SNMP_Embedded.h"   /* v3.3.4: complete SNMPAgent for the built-in uptime mirror */
 #include "include/SNMPParser.h"
@@ -192,3 +193,4 @@ bool SNMPTrap::addOIDPointer(ValueCallback* callback){
     callbacks[callbacksCount++] = callback;
     return true;
 }
+#endif /* !SNMP_NO_TRAPS */

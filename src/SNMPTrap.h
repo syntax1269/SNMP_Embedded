@@ -19,6 +19,20 @@
 	#endif
 #endif
 
+#if SNMP_NO_TRAPS
+/* SNMP_NO_TRAPS: the real class is compiled out. Any instantiation fails
+ * right here with a message naming the flag — loud, never silent. */
+class SNMPTrap {
+  public:
+    template <typename... Args>
+    SNMPTrap(Args...){
+        static_assert(sizeof...(Args) == 0 && !sizeof...(Args),
+            "SNMP_NO_TRAPS is defined (global build flag): the trap/inform API "
+            "is compiled out of this build. Remove -DSNMP_NO_TRAPS to send "
+            "traps/informs, or remove the trap code from the sketch.");
+    }
+};
+#else
 class SNMPTrap : public SNMPPacket {
   public:
     SNMPTrap(const char* community, SNMP_VERSION version){
@@ -189,5 +203,6 @@ class SNMPTrap : public SNMPPacket {
 
     bool build() override;
 };
+#endif /* !SNMP_NO_TRAPS */
 
 #endif

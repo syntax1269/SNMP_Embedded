@@ -60,8 +60,13 @@ $(BUILD_DIR)/%.ino.o: %.ino
 # so the two profiles never share stale objects. Verifies (a) clean compile with
 # the flag, (b) pool/callback counts exactly one less than the default build,
 # (c) sysUpTime behaves as an unregistered OID.
+# NOTE on the "$(BUILD_DIR)/../src" object paths: the ../ escapes BUILD_DIR,
+# so every non-default profile compiles into the SHARED ./src/ dir. Each
+# profile therefore MUST clear ./src first, or it silently reuses the previous
+# profile's objects (observed live: notraps linked against stale nozc objects).
 test-nobuiltinuptime:
 	$(MAKE) BUILD_DIR=./build-nouptime clean
+	$(RM) -r ./src
 	$(MAKE) BUILD_DIR=./build-nouptime CPPFLAGS="$(CPPFLAGS) -DSNMP_NO_BUILTIN_SYSUPTIME" test
 
 # v3.4.0: classic-path escape-hatch profile — SNMP_ZERO_COPY=0. Separate
@@ -70,9 +75,21 @@ test-nobuiltinuptime:
 # -DSNMP_ZERO_COPY=0 remains a valid field escape hatch.
 test-nozc:
 	$(MAKE) BUILD_DIR=./build-nozc clean
+	$(RM) -r ./src
 	$(MAKE) BUILD_DIR=./build-nozc CPPFLAGS="$(CPPFLAGS) -DSNMP_ZERO_COPY=0" test
 
 ci-test-nobuiltinuptime: test-nobuiltinuptime
+
+# v3.4.1: traps/informs compiled out — SNMP_NO_TRAPS=1. Verifies (a) the
+# library compiles with the whole trap/inform path removed, (b) the derived
+# pool drops the 16-slot trap-tree term (formula case), and (c) the
+# remaining suite stays green.
+test-notraps:
+	$(MAKE) BUILD_DIR=./build-notraps clean
+	$(RM) -r ./src
+	$(MAKE) BUILD_DIR=./build-notraps CPPFLAGS="$(CPPFLAGS) -DSNMP_NO_TRAPS=1" test
+
+ci-test-notraps: test-notraps
 
 ci-test-nozc: test-nozc
 

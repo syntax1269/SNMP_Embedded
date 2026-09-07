@@ -39,7 +39,7 @@
 #define LIBRARY_VERSION_MAJOR 3
 #define LIBRARY_VERSION_MINOR 4
 #define LIBRARY_VERSION_PATCH 0
-#define LIBRARY_VERSION "3.4.0"
+#define LIBRARY_VERSION "3.4.1"
 
 typedef enum SNMP_ERROR_RESPONSE {
     SNMP_NO_UDP = -10,
@@ -352,7 +352,31 @@ static_assert( (SNMP_MAX_VARBINDS * SNMP_WORST_CASE_VARBIND_BYTES + SNMP_PACKET_
   #ifndef SNMP_TRAP_VB_RESERVE
     #define SNMP_TRAP_VB_RESERVE 0
   #endif
-  #define SNMP_TRAP_TREE_SLOTS        ( 16 + (SNMP_TRAP_VB_RESERVE) * 3 )
+
+  /*  v3.4.1 — SNMP_NO_TRAPS (permanent public flag, all MCUs)
+   *  Compile-time removal of the whole trap/inform subsystem: the SNMPTrap
+   *  class becomes a loud stub (any instantiation fails to compile with a
+   *  message naming this flag), the agent's inform queue / retry machinery
+   *  and the inform-ack callback are compiled out, and the pool formula
+   *  drops the 16-slot trap-tree term entirely:
+   *      pool = 2*VB + 4 + callbacks          (SNMP_NO_TRAPS=1)
+   *  e.g. the p768 13-handler profile derives 25 slots instead of 33.
+   *  Traps AND informs share the same wire class, so both are disabled —
+   *  documented in README. SNMP_NO_TRAPS=0 (default) is bit-identical to
+   *  every release since v3.3.3. The hardware-proven pool floor (>= 24)
+   *  is intentionally NOT relaxed by this flag: it was earned by crash
+   *  evidence on the request path, which this flag does not touch. */
+  #ifndef SNMP_NO_TRAPS
+    #define SNMP_NO_TRAPS 0
+  #endif
+  #if SNMP_NO_TRAPS && SNMP_TRAP_VB_RESERVE != 0
+    #error "SNMP_NO_TRAPS=1 with SNMP_TRAP_VB_RESERVE>0 is contradictory: traps are compiled out, there is no trap varbind tree to reserve for. Remove one of the two flags."
+  #endif
+  #if SNMP_NO_TRAPS
+    #define SNMP_TRAP_TREE_SLOTS        0
+  #else
+    #define SNMP_TRAP_TREE_SLOTS        ( 16 + (SNMP_TRAP_VB_RESERVE) * 3 )
+  #endif
   #define SNMP_WORST_TICK_TRANSIENTS  \
       ( (SNMP_TRAP_TREE_SLOTS) > ( (SNMP_MAX_VARBINDS) * 2 ) \
           ? (SNMP_TRAP_TREE_SLOTS) : ( (SNMP_MAX_VARBINDS) * 2 ) )

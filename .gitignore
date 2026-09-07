@@ -31,3 +31,4 @@ __pycache__/
 
 # Internal test tooling and records — never public
 .internal_test/
+tests/build-notraps/

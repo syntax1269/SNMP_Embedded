@@ -9,6 +9,7 @@
     #include "tests/required/IPAddress.h"
 #endif
 
+#if !SNMP_NO_TRAPS
 struct InformItem {
     snmp_request_id_t requestID;
     int retries;
@@ -26,4 +27,5 @@ void inform_callback(struct InformItem **informList, int& informCount, snmp_requ
 bool inform_pending_with_id(struct InformItem **informList, int informCount, snmp_request_id_t requestID);
 void handle_inform_queue(struct InformItem **informList, int& informCount);
 void mark_trap_deleted(struct InformItem **informList, int& informCount, SNMPTrap* trap);
+#endif /* !SNMP_NO_TRAPS */
 #endif

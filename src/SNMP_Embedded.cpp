@@ -493,11 +493,14 @@ void SNMPAgent::printAllOIDsTo(Print& out) const {
     }
 }
 
+#if !SNMP_NO_TRAPS
 snmp_request_id_t SNMPAgent::sendTrapTo(SNMPTrap* trap, const IPAddress& ip, bool replaceQueuedRequests, int retries, int delay_ms){
     return queue_and_send_trap(this->informList, this->informCount, trap, ip, replaceQueuedRequests, retries, delay_ms);
 }
+#endif /* !SNMP_NO_TRAPS */
 
 void SNMPAgent::informCallback(void* ctx, snmp_request_id_t requestID, bool responseReceiveSuccess){
+#if !SNMP_NO_TRAPS
     if(!ctx) return;
     SNMPAgent* agent = static_cast<SNMPAgent*>(ctx);
 
@@ -509,12 +512,21 @@ void SNMPAgent::informCallback(void* ctx, snmp_request_id_t requestID, bool resp
     }
 
     return inform_callback(agent->informList, agent->informCount, requestID, responseReceiveSuccess);
+#else
+    /* SNMP_NO_TRAPS=1: no inform queue exists; responses never match a
+     * pending inform, so this trampoline is a structural no-op. */
+    (void)ctx; (void)requestID; (void)responseReceiveSuccess;
+    return;
+#endif /* !SNMP_NO_TRAPS */
 }
 
 void SNMPAgent::handleInformQueue(){
+#if !SNMP_NO_TRAPS
     handle_inform_queue(this->informList, this->informCount);
+#endif /* !SNMP_NO_TRAPS */
 }
 
+#if !SNMP_NO_TRAPS
 void SNMPAgent::markTrapDeleted(SNMPTrap* trap){
     for(int i = 0; i < agentsCount; i++){
         SNMPAgent* agent = agents[i];
@@ -522,6 +534,7 @@ void SNMPAgent::markTrapDeleted(SNMPTrap* trap){
         mark_trap_deleted(agent->informList, agent->informCount, trap);
     }
 }
+#endif /* !SNMP_NO_TRAPS */
 
 bool SNMPAgent::restartUDP() {
     bool all_ok = true;

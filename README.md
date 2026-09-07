@@ -2,7 +2,7 @@
 
 **A memory-safe, deterministic-RAM SNMPv2c agent for Arduino — ESP32 & ESP8266 (proven on a 1 MB ESP8266).**
 
-## Current Version: 3.4.0
+## Current Version: 3.4.1
 
 > **Highlights:** **zero-copy packet path** (in-place BER parse + direct-to-buffer response build — no intermediate containers on the hot path), compile-time **derived resource sizing** with an **exact-pricing pool formula** (every pool slot priced by a named, code-verified consumer), **boot-time arena lock-in**, **stateless trap/inform sends**, **loud failure modes** (over-cap requests answer RFC 3416 `tooBig` instead of being silently dropped), and a **CI-validated test suite** (host Catch2 tests, ESP8266 + ESP32 example compile matrix). See [Version History](#version-history) below.
 
@@ -56,7 +56,9 @@ pool = max( 2*SNMP_MAX_VARBINDS ,                       // request tick: zc Phas
   + SNMP_MAX_CALLBACKS_PER_AGENT            // permanent: OID + value per registered handler
 ```
 
-A single-threaded agent never overlaps a request tick with a trap rebuild, so the worst tick is the **larger** of the two, not their sum. Informs hold **zero** pool slots while queued (stateless design: build → transmit → release; retries rebuild from scratch) — a queued inform costs one small heap record, not packet slots. A sketch that attaches varbinds to its traps sets `SNMP_TRAP_VB_RESERVE` to its maximum trap varbind count (+3 slots each); unreserved overflow fails loudly (pool-exhausted log, trap not sent) rather than silently.
+With `SNMP_NO_TRAPS=1` (v3.4.1) the whole trap tick is priced at zero — the pool becomes simply `2*SNMP_MAX_VARBINDS + 4 + SNMP_MAX_CALLBACKS_PER_AGENT` (e.g. 25 slots instead of 33 on the 13-handler 768-B profile). See the flags table below.
+
+A single-threaded agent never overlaps a request tick with a trap rebuild, so the worst tick is the **larger** of the two, not their sum. Builds that never send traps or informs can set `SNMP_NO_TRAPS=1` (global build flag): the entire trap/inform subsystem — the `SNMPTrap` class, the inform retry queue, the inform-ack callback — is compiled out, any accidental trap call fails to compile with a message naming the flag, and the pool drops the 16-slot trap-tree term. The hardware-proven pool floor (≥ 24 slots) is deliberately not relaxed by this flag: it was earned by crash evidence on the request path, which traps-off does not touch. Informs hold **zero** pool slots while queued (stateless design: build → transmit → release; retries rebuild from scratch) — a queued inform costs one small heap record, not packet slots. A sketch that attaches varbinds to its traps sets `SNMP_TRAP_VB_RESERVE` to its maximum trap varbind count (+3 slots each); unreserved overflow fails loudly (pool-exhausted log, trap not sent) rather than silently.
 
 On the default 13-handler ESP8266 profile this derives **33 slots** — the worst tick (29) plus the 4-slot margin. Measured on hardware: flood + SET + walk + inform-queue-saturated stress peaks at 27 (the 2-slot gap is the declared-vs-registered handler conservatism working as intended).
 
@@ -82,6 +84,7 @@ The arena is **locked in at boot**: every `SNMPAgent` constructor calls `ASNPool
 | `SNMP_POOL_SLOT_SIZE` | 288 | 312 |
 | `SNMP_POOL_ASN_OBJECTS` | derived (exact-pricing formula; e.g. 33 at 24 handlers) | derived (exact-pricing formula) |
 | `SNMP_TRAP_VB_RESERVE` | 0 (raise if traps carry varbinds) | 0 |
+| `SNMP_NO_TRAPS` | 0 (traps + informs enabled) | 0 |
 
 Slot size is pinned to the measured largest BER container by exhaustive `static_assert`s — if a container grows, the build fails loudly instead of silently corrupting.
 
@@ -277,10 +280,25 @@ Notes:
 
 ### Minimal-footprint builds
 
-Define `SNMP_NO_BUILTIN_SYSUPTIME` as a global build flag to remove the
-built-in uptime registration (one pool slot reclaimed). With the flag,
-sysUpTime becomes a normal OID you may register yourself — either
-dynamically or bound to your own variable that you keep fresh.
+Two compile-time flags shrink the agent for endpoints that do not need the
+full feature set. Both are **global build flags** (see the One-Definition
+Rule above) and apply to every MCU and platform the library builds for:
+
+- `SNMP_NO_BUILTIN_SYSUPTIME` — removes the built-in uptime registration
+  (one pool slot reclaimed). With the flag, sysUpTime becomes a normal OID
+  you may register yourself — either dynamically or bound to your own
+  variable that you keep fresh.
+
+- `SNMP_NO_TRAPS` (v3.4.1) — **compile-time removal of the entire trap and
+  inform subsystem** for builds that only ever answer requests. The
+  `SNMPTrap` class, the inform retry queue, and the inform-ack callback do
+  not exist in the binary, and the pool formula drops the 16-slot trap-tree
+  term (`pool = 2*SNMP_MAX_VARBINDS + 4 + SNMP_MAX_CALLBACKS_PER_AGENT`;
+  the 13-handler 768-B profile derives 25 slots instead of 33). Any
+  accidental trap call fails to compile with a message naming the flag and
+  the remedy, and combining it with `SNMP_TRAP_VB_RESERVE > 0` is a build
+  error. The flag is permanent API surface: default-off builds are
+  bit-identical to previous releases.
 
 ### SNMP Traps
 
@@ -396,8 +414,42 @@ inform stops being resent.
 
 ---
 
+## Measured Performance (v3.4.1 harness)
+
+Every number below is a row in the internal measurement history (standardized
+build → flash → soak → CSV runner); nothing is estimated. Reference platform:
+ESP8266 ESP-01, 80 MHz, 768-B packet budget, 13 handlers, unpaced flood load
+(1- and 5-minute soaks).
+
+| Metric | Measured |
+|---|---|
+| Sustained throughput, unpaced flood | **~8.0 ops/s** (2,406–2,428 ops in 5 min) |
+| Per-op latency medians (end-to-end) | GET sysDescr ~67–70 ms · SET ~73–76 ms · GETNEXT ~68–77 ms · 4-varbind bulkwalk ~188–193 ms · 6-wide bulkwalk ~129–140 ms |
+| Pool under flood | 27 of 33 slots — the derived formula holds at max input rate |
+| Heap floor during flood | ~32.5 KB free (frag ≤ 3 %) |
+| Stability record | 0 pool alarms · 0 crashes · 0 reboots across every flood run |
+
+Two honesty notes that the harness proved rather than assumed:
+
+- **Throughput is network-and-host bound, not firmware bound.** Doubling the
+  MCU clock (80 → 160 MHz) moved end-to-end throughput by less than 1.5 %,
+  and swapping the vendor SDK (2.2.1+100 → 3.0.5) moved it by less than 3 %.
+  The agent's share of each operation is a few milliseconds; the rest is the
+  test host's CLI and the UDP round trip.
+- **Flood failures are transport losses, not agent failures.** Across every
+  flood run, the only failed operations were single datagrams lost by the
+  Wi-Fi layer before they reached the agent (≈0.04 % of packets) — the
+  firmware's 15-second diagnostics cadence never wavered and counters stayed
+  consistent in every case.
+
 ## Version History
 
+- **v3.4.1** — **`SNMP_NO_TRAPS`**: compile-time removal of the whole trap/inform
+  subsystem for request-only endpoints (loud compile errors on accidental trap
+  use; pool drops the 16-slot trap-tree term — 25 slots instead of 33 on the
+  13-handler 768-B profile). Flag off (default) is bit-identical to v3.4.0.
+  Also fixes a latent tests-Makefile object-dir collision between local
+  back-to-back profile builds. See the [CHANGELOG](CHANGELOG.md).
 - **v3.4.0** — **Zero-copy packet path**: in-place BER parse over the UDP buffer,
   raw-byte OID dispatch, direct-to-buffer response writing with a measured fit
   check. **Exact-pricing pool formula** — every slot charged to a named consumer;

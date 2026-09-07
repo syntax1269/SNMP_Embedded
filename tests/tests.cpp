@@ -609,6 +609,7 @@ TEST_CASE( "sort/remove handlers ", "[snmp]"){
 
 }
 
+#if !SNMP_NO_TRAPS
 TEST_CASE( "SNMPTraps ", "[snmp]"){
     SNMPTrap* settableNumberTrap = new SNMPTrap("public", SNMP_VERSION_1);
 
@@ -648,7 +649,9 @@ TEST_CASE( "SNMPTraps ", "[snmp]"){
 //    REQUIRE( trapPacket->parseFrom(buffer, 150) == SNMP_PARSE_ERROR_AT_STATE(REQUESTID) );
 
 }
+#endif /* !SNMP_NO_TRAPS */
 
+#if !SNMP_NO_TRAPS
 TEST_CASE( "SNMPInform ", "[snmp]"){
     SNMPTrap* settableNumberTrap = new SNMPTrap("public", SNMP_VERSION_2C);
     settableNumberTrap->setInform(true);
@@ -684,6 +687,7 @@ TEST_CASE( "SNMPInform ", "[snmp]"){
     REQUIRE( trapPacket->packetPDUType == InformRequestPDU );
 
 }
+#endif /* !SNMP_NO_TRAPS */
 
 TEST_CASE( "Test OID Validation ", "[snmp]"){
     REQUIRE( (new OIDType(".1.3.6.1.4.1.52420"))->valid );
@@ -813,6 +817,7 @@ TEST_CASE( "Stale asn_delete after resetAll is silent; true double-destroy still
 }
 
 /* ---- v3.3.3: stateless trap sends — no pool state survives sendTo ---- */
+#if !SNMP_NO_TRAPS
 TEST_CASE( "Repeated trap sends are stateless: no leak, no alarms, packet freed", "[snmp][v3333]" ){
     test_tick_reset();
     ASNPool::resetAll();
@@ -864,6 +869,7 @@ TEST_CASE( "Repeated trap sends are stateless: no leak, no alarms, packet freed"
 }
 
 /* ---- v3.3.2: packet size is the controlling authority ---- */
+#endif /* !SNMP_NO_TRAPS */
 
 TEST_CASE( "v3.3.2: varbind cap is derived from packet budget (all documented profiles)", "[snmp][v3332]"){
     /* ---- the DERIVATION FORMULA, anchored at all four documented budgets ----
@@ -1177,6 +1183,7 @@ TEST_CASE( "v3.3.4 helper: zero-OID call registers nothing; validation errors ar
 
 
 /* ---- v3.3.4 spec test 8: trap timestamp resolves to the built-in uptime ---- */
+#if !SNMP_NO_TRAPS
 TEST_CASE( "v3.3.4 trap timestamp: built-in uptime supplies live sysUpTime, monotone with GET", "[snmp][v334]" ){
     test_tick_reset();
     int baseAlarms = ASNPool::doubleReleaseAlarms;
@@ -1239,6 +1246,8 @@ TEST_CASE( "v3.3.4 trap timestamp: built-in uptime supplies live sysUpTime, mono
 
 
 /* ---- v3.3.5: auto-size SysBuf helper — array registration, SKIP sentinel, SET path ---- */
+#endif /* !SNMP_NO_TRAPS */
+
 TEST_CASE( "v3.3.5 helper: auto-size arrays register without sizeof(); SKIP omits; SET writes the buffer", "[snmp][v335]" ){
     test_tick_reset();
     ASNPool::resetAll();
@@ -1337,6 +1346,7 @@ TEST_CASE( "v3.3.5 helper: auto-size arrays register without sizeof(); SKIP omit
  * ID in handlePacket) now surfaces to sketches: the callback fires once per
  * matched response, never for unsolicited/unmatched Response PDUs, and
  * carries the responder's error outcome. ---- */
+#if !SNMP_NO_TRAPS
 TEST_CASE( "v3.3.6 inform ack callback: fires for matched responses with responder outcome, silent for unmatched", "[snmp][v336]" ){
     test_tick_reset();
     ASNPool::resetAll();
@@ -1451,6 +1461,7 @@ TEST_CASE( "v3.3.6 inform ack callback: fires for matched responses with respond
     REQUIRE( SNMPAgent::testAgentsCount() == 0 );
     REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
 }
+#endif /* !SNMP_NO_TRAPS */
 
 #if SNMP_ZERO_COPY
 /* ==========================================================================

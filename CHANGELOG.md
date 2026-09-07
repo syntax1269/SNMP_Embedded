@@ -1,5 +1,41 @@
 # Changelog — SNMP_Embedded
 
+## v3.4.1 — SNMP_NO_TRAPS: compile-time trap/inform removal
+
+### Added
+- **`SNMP_NO_TRAPS` global build flag** (default `0`, permanent public flag, all MCUs).
+  Compiles the entire trap/inform subsystem out of the binary:
+  - the `SNMPTrap` class becomes a loud stub — any instantiation fails to compile
+    with a message naming the flag and the remedy;
+  - `sendTrapTo()`, `markTrapDeleted()`, `setInformAckCallback()`, the inform retry
+    queue and the inform-ack machinery are compiled out of the agent;
+  - the pool formula drops the 16-slot trap-tree term:
+    `pool = 2*SNMP_MAX_VARBINDS + 4 + SNMP_MAX_CALLBACKS_PER_AGENT`
+    (13-handler 768-B profile: 25 slots instead of 33).
+- `test-notraps` host profile (CI: `ci-test-notraps`) — the full suite minus the
+  five trap/inform cases, plus a formula case with `static_assert` proof that the
+  trap-tree term is zero and the pool derivation is exact.
+- `#error` guard: `SNMP_NO_TRAPS=1` together with `SNMP_TRAP_VB_RESERVE > 0`
+  fails at build time (contradictory configuration).
+
+### Fixed
+- tests Makefile object-dir collision: `BUILD_DIR=./build-<profile>` profile builds
+  compile objects into `tests/src/` (the `../src` in the object path escapes the
+  build dir), so two profile builds run back-to-back silently reused each other's
+  objects. Every non-default profile target now clears the shared directory first
+  (CI on clean checkouts was unaffected; local back-to-back runs were not).
+
+### Validation
+- Host matrix: default **2,125 assertions / 28 cases**, zero-copy-off **262 / 23**,
+  no-builtin-uptime **2,057 / 23**, no-traps **2,043 / 23** — all green; default
+  counts identical to v3.4.0 (flag-off is behavior-identical).
+- Loud-failure probe: instantiating `SNMPTrap` under the flag fails at compile
+  time with the flag named in the message.
+- Hardware (ESP8266 ESP-01, standardized flood harness, flag off): 1-min and
+  5-min unpaced soaks PASS — pool 27/33, heap floor 32,496 B, frag ≤1 %,
+  0 alarms / 0 crashes / 0 reboots.
+
+
 ## v3.4.0 — Zero-copy packet path + exact-pricing pool formula
 
 **No public API changes. Existing sketches compile and behave identically.**
