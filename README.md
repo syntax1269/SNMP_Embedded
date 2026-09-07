@@ -2,9 +2,9 @@
 
 **A memory-safe, deterministic-RAM SNMPv2c agent for Arduino — ESP32 & ESP8266 (proven on a 1 MB ESP8266).**
 
-## Current Version: 3.3.6
+## Current Version: 3.4.0
 
-> **Highlights:** compile-time **derived resource sizing** (packet budget → varbind cap → pool size; no magic numbers), **boot-time arena lock-in** (memory claimed before `setup()`/WiFi — immune to heap fragmentation), **stateless trap/inform sends** (no pool-backed state survives a transmit), **loud failure modes** (over-cap requests answer RFC 3416 `tooBig` instead of being silently dropped), and a **CI-validated test suite** (arduino-lint, host Catch2 tests, ESP8266 + ESP32 example compile matrix). See [Version History](#version-history) below.
+> **Highlights:** **zero-copy packet path** (in-place BER parse + direct-to-buffer response build — no intermediate containers on the hot path), compile-time **derived resource sizing** with an **exact-pricing pool formula** (every pool slot priced by a named, code-verified consumer), **boot-time arena lock-in**, **stateless trap/inform sends**, **loud failure modes** (over-cap requests answer RFC 3416 `tooBig` instead of being silently dropped), and a **CI-validated test suite** (host Catch2 tests, ESP8266 + ESP32 example compile matrix). See [Version History](#version-history) below.
 
 **All development on SNMP_Embedded happens in this repository.**
 
@@ -45,18 +45,26 @@ The example goes into detail around how to use, or look at `src/SNMP_Embedded.h`
 
 ## Memory Model
 
-The ASN pool is **derived at compile time** from the flags your build already sets — there is no fixed pool size to hand-tune:
+The ASN pool is **derived at compile time** from the flags your build already sets — there is no fixed pool size to hand-tune. Since v3.4.0 the formula is **exactly priced**: every slot is charged to a named, source-verified consumer, with nothing left unexplained:
 
 ```
-pool = SNMP_WORST_TICK_TRANSIENTS + SNMP_MAX_CALLBACKS_PER_AGENT
-
-SNMP_WORST_TICK_TRANSIENTS
-    = (SNMP_MAX_VARBINDS + 2) * 3        // GetBulk response at the varbind cap
-    + (SNMP_MAX_TRAPS_INFLIGHT) * 3      // inflight informs decoded while a response builds
-    + 24                                 // measured parse/response headroom
+pool = max( 2*SNMP_MAX_VARBINDS ,                       // request tick: zc Phase A holds
+                                            //   VB decoded values + VB response values
+            16 + 3*SNMP_TRAP_VB_RESERVE )   // trap tick: minimal v2c trap tree =
+                                            //   4 envelope + 5 PDU header + 7 mandatory varbinds
+  + 4                                       // SNMP_POOL_IDLE_MARGIN: explicit idle buffer
+  + SNMP_MAX_CALLBACKS_PER_AGENT            // permanent: OID + value per registered handler
 ```
 
-A sketch registering 12 handlers derives a smaller arena than one registering 40; a 40-handler deployment gets the pool the old fixed arena would have starved. The headroom term is measured, not guessed: 60 s of sustained Cr6-walk + SET + trap saturation on an ESP8266 peaked at 66 slots at TINY caps.
+A single-threaded agent never overlaps a request tick with a trap rebuild, so the worst tick is the **larger** of the two, not their sum. Informs hold **zero** pool slots while queued (stateless design: build → transmit → release; retries rebuild from scratch) — a queued inform costs one small heap record, not packet slots. A sketch that attaches varbinds to its traps sets `SNMP_TRAP_VB_RESERVE` to its maximum trap varbind count (+3 slots each); unreserved overflow fails loudly (pool-exhausted log, trap not sent) rather than silently.
+
+On the default 13-handler ESP8266 profile this derives **33 slots** — the worst tick (29) plus the 4-slot margin. Measured on hardware: flood + SET + walk + inform-queue-saturated stress peaks at 27 (the 2-slot gap is the declared-vs-registered handler conservatism working as intended).
+
+### The zero-copy packet path (v3.4.0)
+
+Inbound packets are parsed **in place** over the UDP buffer: a flat TLV walk (`BerView`/`ber_peek`) validates structure and records slices — no per-varbind OID containers, no dotted-string renders. Handler dispatch matches the request's raw encoded-OID bytes against handler OIDs (`memcmp`) — the same bytes that define sort order, so walk semantics are exact. Responses are written **directly into the outgoing UDP buffer** (`BerWriter`): request OID slices are echoed verbatim, handler values are encoded once, and the response-size fit check is *measured*, not worst-case arithmetic — `tooBig` is answered only when genuinely true.
+
+The owning container API (`SNMPPacket::parseFrom()`) is unchanged and remains the public contract for sketches that parse packets directly. `SNMP_ZERO_COPY=0` (global build flag) restores the classic container path unchanged as an escape hatch.
 
 The arena is **locked in at boot**: every `SNMPAgent` constructor calls `ASNPool::lockInArena()`, which claims the one contiguous `sizeof(Slot) x SNMP_POOL_ASN_OBJECTS` block at global-constructor time — before `setup()`, before WiFi — while the heap is pristine. This replaces lazy first-parse allocation, which can fail on a fragmented heap and abort the sketch (ESP8266 runs with exceptions disabled). Lock-in is no-throw: on failure it logs a warning and falls back to the lazy path. `SNMP_POOL_LOCK_AT_BOOT=0` (global build flag) restores lazy allocation; `SNMP_POOLS_IN_BSS=1` places the arena in static BSS instead.
 
@@ -72,7 +80,8 @@ The arena is **locked in at boot**: every `SNMPAgent` constructor calls `ASNPool
 | `SNMP_MAX_TRAPS_INFLIGHT` | 4 | 8 |
 | `SNMP_MAX_CALLBACKS_PER_TRAP` | 8 | 16 |
 | `SNMP_POOL_SLOT_SIZE` | 288 | 312 |
-| `SNMP_POOL_ASN_OBJECTS` | derived (84 at TINY defaults) | derived (96 at default caps) |
+| `SNMP_POOL_ASN_OBJECTS` | derived (exact-pricing formula; e.g. 33 at 24 handlers) | derived (exact-pricing formula) |
+| `SNMP_TRAP_VB_RESERVE` | 0 (raise if traps carry varbinds) | 0 |
 
 Slot size is pinned to the measured largest BER container by exhaustive `static_assert`s — if a container grows, the build fails loudly instead of silently corrupting.
 
@@ -280,10 +289,20 @@ You can send SNMP v1 traps, as well as SNMPv2 Trap and INFORMS with this library
 There are a few requirements in setting up a trap in order to comply with the SNMP RFC.
 
 ```
-// Setup a trap object for later use, specify the SNMP version to use 
+// Setup a trap object for later use, specify the SNMP version to use
 // SNMP_VERSION_1 or SNMP_VERSION_2C
 
-SNMPTrap* testTrap = new SNMPTrap("public", SNMP_VERSION_2C);
+// PREFERRED on embedded targets: construct it STATICALLY (global or `static`).
+// The constructor itself never allocates, so a static trap object costs only
+// its sizeof() in static RAM and keeps the runtime steady state entirely free
+// of dynamic allocations — the main agent loop is already allocation-free by
+// design, and a static trap preserves that guarantee for the trap path too.
+static SNMPTrap testTrap("public", SNMP_VERSION_2C);
+
+// Pointer style is still supported (e.g. when the trap's lifetime must be
+// managed manually), but on low-memory targets prefer the static form above:
+// SNMPTrap* testTrap = new SNMPTrap("public", SNMP_VERSION_2C);   // heap
+//   — create it once during startup (never per-send) if you use this form.
 ```
 
 **Uptime timestamp:** SNMP traps must carry a sysUpTime value. Since
@@ -302,26 +321,27 @@ In `setup()` (only needed when overriding the built-in uptime):
 timestampCallback = (TimestampCallback*)snmp.addTimestampHandler(".1.3.6.1.2.1.1.3.0", &tensOfMillisCounter);
 
 // Set UDP Object for trap to be sent on
-testTrap->setUDP(&udp);
+testTrap.setUDP(&udp);
 
-// OID of the trap (C-style string)
-testTrap->setTrapOID(new OIDType(".1.3.6.1.2.1.33.2"));
+// OID of the trap — pass the C-style string; the library heap-allocates the
+// OID ONCE here and owns/frees it across sends (never allocate it per send):
+testTrap.setTrapOID(".1.3.6.1.2.1.33.2");
 
 // Specific Number of the trap
-testTrap->setSpecificTrap(1);
+testTrap.setSpecificTrap(1);
 
 // Set the uptime counter to use in the trap (optional since v3.3.4 —
 // omit it and the library's built-in live uptime is used automatically)
-testTrap->setUptimeCallback(timestampCallback);
+testTrap.setUptimeCallback(timestampCallback);
 
 // Set some previously set OID Callbacks to send these values with the trap (optional)
-testTrap->addOIDPointer(previouslySetValueCallback);
+testTrap.addOIDPointer(previouslySetValueCallback);
 
 // Set our Source IP so the receiver knows where this is coming from
-testTrap->setIP(WiFi.localIP());
+testTrap.setIP(WiFi.localIP());
 
 // Set INFORM to be true or false (only works for SNMPV2 traps)
-testTrap->setInform(true);
+testTrap.setInform(true);
 ```
 
 in `loop()`
@@ -337,7 +357,7 @@ tensOfMillisCounter = millis()/10;
 
 IPAddress destinationIP = IPAddress(192, 168, 1, 243);
 
-if(snmp.sendTrapTo(testTrap, destinationIP, true, 2, 5000) != INVALID_SNMP_REQUEST_ID){
+if(snmp.sendTrapTo(&testTrap, destinationIP, true, 2, 5000) != INVALID_SNMP_REQUEST_ID){
     Serial.println("Sent SNMP Trap");
 } else {
     Serial.println("Couldn't send SNMP Trap");
@@ -378,6 +398,13 @@ inform stops being resent.
 
 ## Version History
 
+- **v3.4.0** — **Zero-copy packet path**: in-place BER parse over the UDP buffer,
+  raw-byte OID dispatch, direct-to-buffer response writing with a measured fit
+  check. **Exact-pricing pool formula** — every slot charged to a named consumer;
+  pool −42/−58% by profile, free heap **+7.1 KB / +13.6 KB**, throughput +24–28%,
+  byte-verified wire-identical. New `SNMP_TRAP_VB_RESERVE` flag; `SNMP_ZERO_COPY=0`
+  escape hatch. No API changes. See the [CHANGELOG](CHANGELOG.md) for the full
+  measured table.
 - **v3.3.5** — Auto-size `addRFC1213SystemGroup()`: pass the buffer **arrays**
   directly (five arguments, no `sizeof()`); capacity is deduced from the array
   type, and a bare `char*` (unknown capacity) fails to compile. `RFC1213_SKIP`

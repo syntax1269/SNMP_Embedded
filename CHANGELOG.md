@@ -1,5 +1,81 @@
 # Changelog — SNMP_Embedded
 
+## v3.4.0 — Zero-copy packet path + exact-pricing pool formula
+
+**No public API changes. Existing sketches compile and behave identically.**
+Wire behavior is byte-verified identical to v3.3.6 (host equivalence suite,
+byte-for-byte response comparison across GET / GETNEXT / GETBULK / SET / error paths).
+
+### Added
+
+- **Zero-copy packet path** (default): inbound packets are parsed in place over
+  the UDP buffer (`BerView` TLV walk — no per-varbind OID containers, no
+  dotted-string renders); responses are written directly into the outgoing UDP
+  buffer (`BerWriter`, with atomic TLV writes and a *measured* — not worst-case —
+  response-size fit check, so `tooBig` is answered only when genuinely true).
+  Handler dispatch matches raw encoded-OID bytes (`memcmp`) — exactly the bytes
+  that define sort order, so walk semantics are exact.
+- **`SNMP_ZERO_COPY=0`** global build flag: restores the classic container path
+  unchanged (field escape hatch; kept compiling in CI as `make test-nozc`).
+- **`SNMP_TRAP_VB_RESERVE`** global build flag (default 0): sketches that attach
+  varbinds to traps reserve 3 pool slots per trap varbind. Unreserved overflow
+  fails loudly (pool-exhausted log, trap not sent) — same behavior as all
+  previous releases for >4-varbind traps.
+- Host suite grew from 262 assertions / 23 cases to **2,125 assertions / 28
+cases** (fixture-corpus equivalence, BerWriter byte-equivalence, staged zc
+handler parity, tooBig boundaries).
+
+### Changed
+
+- **Pool formula: exact pricing** (replaces the worst-case-estimated formula).
+  Every slot is charged to a named, source-verified consumer:
+
+  ```
+  pool = max( 2*SNMP_MAX_VARBINDS , 16 + 3*SNMP_TRAP_VB_RESERVE )   // worst tick
+       + 4                                                          // explicit idle margin
+       + SNMP_MAX_CALLBACKS_PER_AGENT                               // permanent handlers
+  ```
+
+  Request tick = VB decoded + response value containers (2·VB); trap tick =
+  the minimal v2c trap tree (16 slots: 4 envelope + 5 PDU header + 7 mandatory
+  varbinds — counted line-by-line in the source). A single-threaded agent never
+  overlaps the two, so the worst tick is the larger, not the sum. Queued informs
+  hold **zero** pool slots (stateless design — proven on hardware with the
+  inform queue saturated under flood).
+
+- `SNMP_MAX_VARBINDS` and the response budget are unchanged; no capacity flags
+  moved in this release (one variable at a time — the slot savings are banked
+  as measured heap headroom).
+
+### Measured on hardware (ESP8266 ESP-01, standardized flood harness, full CSV history)
+
+| Metric | v3.3.6 | v3.4.0 | Delta |
+|---|---|---|---|
+| Pool cap (13-handler profile, both packet budgets) | 57 / 79 | **33 / 33** | −42% / −58% |
+| Pool peak under flood+SET+walk+inform-stress | 57 (saturated) | **27** | −53% |
+| Idle slots at modeled worst tick | 0 | 4 | exact margin |
+| Free heap at boot, 768-B profile | 28,632 B | **35,736 B** | **+7.1 KB (+25%)** |
+| Free heap at boot, 1400-B profile | 21,424 B | **35,040 B** | **+13.6 KB (+64%)** |
+| Sustained request throughput (interval-paced soak) | 2.35 ops/s | 2.91–3.03 ops/s | **+24–28%** |
+| Flash (IROM), 768-B profile | 307,360 B | 301,936 B | −5.4 KB |
+| Alarms / crashes / reboots (all soaks) | 0 | 0 | parity |
+| SET round-trip integrity | 100% | 100% | parity |
+
+Hardware validation: per profile, 1-minute, 5-minute, and 15-minute flood soaks
+(bulkwalk + wide-walk-tooBig + GETNEXT + SET + sysDescr mix), plus a dedicated
+inform-queue-saturation stress profile; 0 pool alarms, 0 crashes, 0 reboots
+across the entire campaign.
+
+### Internal
+
+- Phase-gated development with measured decision gates: Strategy A/B OID-matching
+  benchmark (A: memcmp won 3–4.6× with far lower stack cost; B removed),
+  BerWriter byte-equivalence proof, staged response plans (all request slices
+  staged before any response byte is written — immune to buffer aliasing),
+  worst-tick calibration stress probe, and a fully source-cited pool formula.
+
+---
+
 ## v3.3.6 — Sketch-facing inform delivery confirmation (`setInformAckCallback`)
 
 **Additive API. No breaking changes; the inform state machine's behavior without a callback is unchanged.**

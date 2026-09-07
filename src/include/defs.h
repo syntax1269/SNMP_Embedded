@@ -37,9 +37,9 @@
 #endif
 
 #define LIBRARY_VERSION_MAJOR 3
-#define LIBRARY_VERSION_MINOR 3
-#define LIBRARY_VERSION_PATCH 6
-#define LIBRARY_VERSION "3.3.6"
+#define LIBRARY_VERSION_MINOR 4
+#define LIBRARY_VERSION_PATCH 0
+#define LIBRARY_VERSION "3.4.0"
 
 typedef enum SNMP_ERROR_RESPONSE {
     SNMP_NO_UDP = -10,
@@ -171,6 +171,36 @@ extern const char* SNMP_TAG;
 #ifndef SNMP_MAX_VARBINDS
   #define SNMP_MAX_VARBINDS  ( (MAX_SNMP_PACKET_LENGTH - SNMP_PACKET_FIXED_OVERHEAD) / SNMP_WORST_CASE_VARBIND_BYTES )
 #endif
+
+/* =====================================================================
+ *  v3.4.0 PHASE 1 — ZERO-COPY DECODE (plan-UDP-BER-parse)
+ *  ---------------------------------------------------------------------
+ *  SNMP_ZERO_COPY=1 (default) enables the in-place BER view walk
+ *  (ber_peek/BerView + snmp_ber_peek_packet): TLVs are inspected directly
+ *  inside the UDP packet buffer with const uint8_t* slices — no container
+ *  materialization on the decode path.  Phase 1 wires NOTHING into the
+ *  request path: handlePacket()/parseFrom() behavior is bit-identical;
+ *  the flag only compiles the new decoder + its host equivalence tests.
+ *  Phases 2-4 migrate dispatch/serialization; SNMP_ZERO_COPY=0 stays the
+ *  permanent A/B escape hatch (plan §8.3: parseFrom() stays owning).
+ *
+ *  SNMP_ZC_MAX_VARBINDS caps the per-packet varbind VIEW table (stack,
+ *  ~17 B/varbind).  It must cover the wire cap SNMP_MAX_VARBINDS; larger
+ *  requests are still walked (count is exact) but slices beyond the table
+ *  are not recorded — flagged via SnmpHeaderView::varbindsTruncated.
+ *  Not a class-layout flag: per-TU override is safe, global -D remains
+ *  the recommended style.
+ * ===================================================================== */
+#ifndef SNMP_ZERO_COPY
+  #define SNMP_ZERO_COPY 1
+#endif
+#if SNMP_ZERO_COPY
+  #ifndef SNMP_ZC_MAX_VARBINDS
+    #define SNMP_ZC_MAX_VARBINDS 16
+  #endif
+  static_assert(SNMP_ZC_MAX_VARBINDS >= SNMP_MAX_VARBINDS,
+                "SNMP_ZC_MAX_VARBINDS must cover SNMP_MAX_VARBINDS (varbind view table smaller than the wire cap) - raise SNMP_ZC_MAX_VARBINDS");
+#endif
 /* Compile-time guarantee: a CAP-MAX response of worst-case varbinds fits
  * the packet buffer.  Catches user overrides (-D pairs) that break the
  * invariant the derivation enforces by default. */
@@ -224,15 +254,43 @@ static_assert( (SNMP_MAX_VARBINDS * SNMP_WORST_CASE_VARBIND_BYTES + SNMP_PACKET_
  *  instead of a fixed 76/80 that assumes a ~23-handler deployment:
  *
  *      pool = WORST_TICK_TRANSIENTS  (from caps below, at full concurrency)
+ *           + SNMP_POOL_IDLE_MARGIN  (over-provision buffer, default 4)
  *           + SNMP_MAX_CALLBACKS_PER_AGENT  (the sketch's declared OID count;
  *             each handler contributes a permanent OID + value object that
  *             must survive resetAll() — the frozen permanent baseline)
  *
- *  WORST_TICK_TRANSIENTS = CAP+2 (GetBulk response at the varbind cap,
- *  each VB = OID + value + VarBind envelope, plus PDU/VarBindList
- *  envelopes) + IF*3 (traps: envelope + OID + value each, decoded while a
- *  response is being built) + VB*6 (walk-chain reserve + parse headroom,
- *  proportional to request width).
+ *  WORST_TICK_TRANSIENTS = width-proportional response/parse reserve.
+ *
+ *  v3.4.0 RECALIBRATION (owner-amended §8.2 — supersedes the v3.3.3
+ *  "shrink nothing" decision): the zero-copy packet path no longer holds
+ *  a pool-resident OID container per request varbind (2n → n slots at
+ *  parse), so the width terms are reduced accordingly and the margin is
+ *  an EXPLICIT, fixed idle buffer instead of the flood-calibrated +5 that
+ *  was embedded in the old 8*VB constant:
+ *
+ *    SNMP<=6:  5*VB   — zc parse+build measured peak 27 on both profiles
+ *                       (1/5/15-min soaks, v3.4.0 campaign); classic
+ *                       formula (8*VB) measured peak 51 → saturated 57.
+ *                       5*VB@4=20 + traps 12 = 32 ≥ measured worst tick.
+ *    SNMP>6:   (VB+2)*2 + 12 — zc equivalent of the classic wide term.
+ *
+ *  SNMP_POOL_IDLE_MARGIN = 4: exactly 4 idle slots at the derived worst
+ *  tick. Conservative on BSS (static arena) AND heap headroom, replacing
+ *  the implicit historical margins of +5..+6.  Any soak peak that reaches
+ *  cap−2 or higher is a campaign failure by definition (see hwtest).
+ *
+ *  HISTORY OF THIS RECALIBRATION (all hardware-proven on ESP8266, metrics.csv):
+ *    v3.3.x classic:      8*VB + 3*IF  → pool 57/79 (baseline saturated 57/57)
+ *    v3.4.0 first pass:   5*VB/(VB+2)*2+12 + 3*IF + 4 → pool 49/61 (peak 27)
+ *    v3.4.0b:             3*IF dropped (stateless informs hold no slots —
+ *                         stress-proven) → pool 37/37, re-proof campaign green
+ *    v3.4.0c final:       exact pricing max(2*VB, 14+3*TRAP_VB_RESERVE) + 4
+ *                         → pool 33/33 (default reserve 0), worst tick =
+ *                         declared permanent 13 + trap tree 16 = 29 → idle 4
+ *                         at cap 33. Measured peak 27 = 11 actual permanent
+ *                         (harness registers 11 of its declared 13) + 16.
+ *  If informs ever become tree-resident again (e.g. retry reuses the built
+ *  tree), restore the 3*IF term BEFORE raising IF.
  *
  *  PROVENANCE OF THE MARGIN (v3.3.3): the original +24 flat term came from
  *  MEASURED worst ticks on ESP8266 (usedCountPeak 66 at TINY caps under
@@ -267,24 +325,43 @@ static_assert( (SNMP_MAX_VARBINDS * SNMP_WORST_CASE_VARBIND_BYTES + SNMP_PACKET_
  *  reboot loop. ALWAYS set these via GLOBAL build flags (-D on platformio.ini
  *  build_flags / arduino-cli --build-flags) so every TU agrees.
  * ===================================================================== */
+
 #ifndef SNMP_WORST_TICK_TRANSIENTS
-  /* v3.3.3: flood-calibrated margin, piecewise on request width.
-   *  3*IF      traps in flight (envelope + OID + value each)
-   *  VB<=6:    8*VB — flood-calibrated narrow profile.  Four 5-minute
-   *            200 ms-period floods at the 768-B profile (VB=4) peaked at
-   *            usedCount 51 -> pool 56 at 12 handlers = margin 5.  VB6 ->
-   *            60, the hardware-proven TINY value, UNCHANGED
-   *            (measured peak 66 -> pool 72 at 12 handlers, margin 6).
-   *  VB>6:     3*(VB+2)+24 — the response+headroom terms for wide profiles,
-   *            UNCHANGED, so generic profiles neither grow nor shrink
-   *            (VB8/IF8 -> 78; any larger override, e.g. VB16/IF8 -> 102,
-   *            as proven across the reliability campaign).
-   *  Net effect: only builds narrower than the proven TINY cap tighten. */
-  #define SNMP_WORST_TICK_TRANSIENTS  ( (SNMP_MAX_TRAPS_INFLIGHT) * 3 \
-      + ( ((SNMP_MAX_VARBINDS) <= 6) ? (SNMP_MAX_VARBINDS) * 8 : ( (SNMP_MAX_VARBINDS) + 2 ) * 3 + 24 ) )
+  /* v3.4.0c: exact transient pricing (owner-verified decomposition).
+   *  Single-threaded agent: a request tick and a trap rebuild NEVER overlap,
+   *  so the worst tick is the LARGER of the two, not their sum.
+   *
+   *  Request tick: 2*VB — zc Phase A holds VB decoded request values + VB
+   *      response value containers (SET worst case); OIDs/envelopes/community
+   *      are stack or wire slices, never pool slots.
+   *
+   *  Trap/inform rebuild: 16 + 3*SNMP_TRAP_VB_RESERVE — the minimal v2c
+   *      tree, counted line-by-line from _build_pdu_envelope +
+   *      _trap_build_fill_pdu + SNMPTrap::generateVarBindListRaw:
+   *        envelope 4 (root, version, community, snmpPDU)
+   *        PDU header 5 (trapOID, agentIP, generic, specific, timestamp)
+   *        mandatory varbinds 7 (VBList wrapper; sysUpTime wrapper+OID+value;
+   *                             snmpTrapOID wrapper + OID + trapOID clone)
+   *      Each sketch-added trap varbind costs 3 more slots (wrapper + OID
+   *      clone + value) and must be reserved explicitly.
+   *
+   *  SNMP_TRAP_VB_RESERVE (default 0) is that opt-in: sketches that attach
+   *  varbinds to traps set it to their maximum count and the pool grows by
+   *  3 slots each. Unreserved overflow fails LOUDLY at build time (pool
+   *  exhausted log, trap not sent) — the sanctioned v3.3.3 failure mode. */
+  #ifndef SNMP_TRAP_VB_RESERVE
+    #define SNMP_TRAP_VB_RESERVE 0
+  #endif
+  #define SNMP_TRAP_TREE_SLOTS        ( 16 + (SNMP_TRAP_VB_RESERVE) * 3 )
+  #define SNMP_WORST_TICK_TRANSIENTS  \
+      ( (SNMP_TRAP_TREE_SLOTS) > ( (SNMP_MAX_VARBINDS) * 2 ) \
+          ? (SNMP_TRAP_TREE_SLOTS) : ( (SNMP_MAX_VARBINDS) * 2 ) )
+#endif
+#ifndef SNMP_POOL_IDLE_MARGIN
+  #define SNMP_POOL_IDLE_MARGIN 4
 #endif
 #ifndef SNMP_POOL_ASN_OBJECTS
-  #define SNMP_POOL_ASN_OBJECTS  ( SNMP_WORST_TICK_TRANSIENTS + SNMP_MAX_CALLBACKS_PER_AGENT )
+  #define SNMP_POOL_ASN_OBJECTS  ( SNMP_WORST_TICK_TRANSIENTS + SNMP_POOL_IDLE_MARGIN + SNMP_MAX_CALLBACKS_PER_AGENT )
 #endif
 /* SNMP_POOL_LOCK_AT_BOOT = 1 (default) makes every SNMPAgent constructor
  * pre-allocate the whole ASN pool arena at global-constructor time — before

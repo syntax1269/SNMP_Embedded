@@ -1,5 +1,6 @@
 #include "include/ValueCallbacks.h"
 #include "include/BER.h"
+#include "include/BERView.h"
 
 #include <algorithm>
 
@@ -73,6 +74,66 @@ ValueCallback* ValueCallback::findCallback(ValueCallback* const *callbacks, int 
     }
     return nullptr;
 }
+
+#if SNMP_ZERO_COPY
+/* ---- v3.4.0 Phase 2 — slice-based matching (zero-copy) ----
+ * The request OID stays a const uint8_t* into the packet buffer; handler
+ * OIDs are compared through their encoded-byte accessors.  No dotted-string
+ * render anywhere in this path.
+ *
+ * Walk semantics (contract twin of findCallback above, which this must
+ * never drift from — the host equivalence suite pins both to identical
+ * results across a randomized corpus):
+ *   !walk : exact match only.
+ *   walk  : exact match -> return the NEXT handler in sorted order;
+ *           otherwise the first handler whose OID extends the request OID
+ *           (a GETNEXT starting above a registered root).
+ *
+ * Strategy A (encoded-byte memcmp) was SELECTED by the Phase 2 measurement
+ * gate (see .internal_test/baseline_v340_phase0/PHASE2_EVIDENCE.md): ~3-4.6x
+ * faster than arc-list decode and O(1) stack.  The arc-decode alternative
+ * (former SNMP_ZC_MATCH_STRATEGY=2) was dropped after the gate — its decode
+ * loop cost more cycles AND ~272 B of task stack per compared handler.
+ * Numeric sort order of the roster makes prefix memcmp sufficient for both
+ * exact and subtree decisions (equivalence suite pins this). */
+
+ValueCallback* ValueCallback::findCallbackForSlice(ValueCallback* const *callbacks, int callbacksCount,
+                                                   const uint8_t* oidData, int oidLen, bool walk,
+                                                   int startAt, int *foundAt){
+    bool useNext = false;
+
+    for(int i = startAt; i < callbacksCount; i++){
+        ValueCallback* callback = callbacks[i];
+        const uint8_t* cbData = callback->OID->encodedData();
+        int cbLen = callback->OID->encodedLen();
+
+        if(useNext){
+            if(foundAt) *foundAt = i;
+            return callback;
+        }
+
+        bool exact = (cbLen == oidLen) && (memcmp(cbData, oidData, (size_t)oidLen) == 0);
+        if(exact){
+            if(walk){
+                useNext = true;
+                continue;
+            }
+            if(foundAt) *foundAt = i;
+            return callback;
+        }
+
+        /* walk start ABOVE a registered root: the handler sits BELOW the
+         * request point (callback OID extends the request OID — the exact
+         * contract of OIDType::isSubTreeOf).  Numeric sort order guarantees
+         * the first such handler is the one lexical GETNEXT lands on. */
+        if(walk && cbLen > oidLen && memcmp(cbData, oidData, (size_t)oidLen) == 0){
+            if(foundAt) *foundAt = i;
+            return callback;
+        }
+    }
+    return nullptr;
+}
+#endif /* SNMP_ZERO_COPY */
 
 std::shared_ptr<BER_CONTAINER> ValueCallback::getValueForCallback(ValueCallback* callback){
     SNMP_LOGD("Getting value for callback of OID: %s, type: %d\n", callback->OID->string(), callback->type);

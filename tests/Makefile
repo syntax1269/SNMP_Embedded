@@ -54,7 +54,7 @@ $(BUILD_DIR)/%.ino.o: %.ino
 	rm $@.cpp
 
 
-.PHONY: clean test benchmark example ci-test test-nobuiltinuptime ci-test-nobuiltinuptime
+.PHONY: clean test benchmark example ci-test test-nobuiltinuptime ci-test-nobuiltinuptime test-nozc ci-test-nozc
 
 # v3.3.4: opt-out profile — SNMP_NO_BUILTIN_SYSUPTIME build. Separate BUILD_DIR
 # so the two profiles never share stale objects. Verifies (a) clean compile with
@@ -64,7 +64,17 @@ test-nobuiltinuptime:
 	$(MAKE) BUILD_DIR=./build-nouptime clean
 	$(MAKE) BUILD_DIR=./build-nouptime CPPFLAGS="$(CPPFLAGS) -DSNMP_NO_BUILTIN_SYSUPTIME" test
 
+# v3.4.0: classic-path escape-hatch profile — SNMP_ZERO_COPY=0. Separate
+# BUILD_DIR. Verifies (a) the owning-container path still compiles with the
+# zero-copy fast path compiled out, and (b) its suite stays green, so
+# -DSNMP_ZERO_COPY=0 remains a valid field escape hatch.
+test-nozc:
+	$(MAKE) BUILD_DIR=./build-nozc clean
+	$(MAKE) BUILD_DIR=./build-nozc CPPFLAGS="$(CPPFLAGS) -DSNMP_ZERO_COPY=0" test
+
 ci-test-nobuiltinuptime: test-nobuiltinuptime
+
+ci-test-nozc: test-nozc
 
 clean:
 	$(RM) -r ./build

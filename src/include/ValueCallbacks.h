@@ -2,6 +2,7 @@
 #define VALUE_CALLBACKS_h
 
 #include "BER.h"
+#include "BERView.h"
 #include <algorithm>
 
 template <typename T>
@@ -40,6 +41,18 @@ class ValueCallback {
     virtual const char* getAccessTag() const noexcept { return isSettable ? "RW" : "RO"; }
 
     static ValueCallback* findCallback(ValueCallback* const *callbacks, int callbacksCount, const OIDType* const oid, bool walk, int startAt = 0, int *foundAt = nullptr);
+#if SNMP_ZERO_COPY
+    /* v3.4.0 Phase 2 — dispatch on the raw encoded-OID slice (zero-copy).
+     * Exact contract twin of findCallback(): same walk semantics (exact
+     * match, or next-in-sorted-order; subtree catch for walk start points),
+     * same sorted-roster preconditions — but compares against the request's
+     * wire bytes directly.  Matching never copies, renders, or allocates.
+     * Returns nullptr when no handler matches (caller emits noSuchObject /
+     * endOfMibview exactly as today). */
+    static ValueCallback* findCallbackForSlice(ValueCallback* const *callbacks, int callbacksCount,
+                                               const uint8_t* oidData, int oidLen, bool walk,
+                                               int startAt = 0, int *foundAt = nullptr);
+#endif /* SNMP_ZERO_COPY */
     static std::shared_ptr<BER_CONTAINER> getValueForCallback(ValueCallback* callback);
     static SNMP_ERROR_STATUS setValueForCallback(ValueCallback* callback, const std::shared_ptr<BER_CONTAINER> &value);
 

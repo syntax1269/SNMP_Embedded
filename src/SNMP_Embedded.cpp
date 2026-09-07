@@ -279,7 +279,15 @@ SNMP_ERROR_RESPONSE SNMPAgent::loop(){
             SNMP_LOGI("loop: UDP[%d] read OK. Calling handlePacket(len=%d)...\n", i, packetLength);
 
             int responseLength = 0;
+            /* v3.4.0: SNMP_ZERO_COPY=1 (default) routes through the in-place
+             * zero-copy handler (wire-identical to handlePacket, pinned by
+             * the host equivalence suite); =0 restores the classic
+             * container path byte-for-byte. */
+#if SNMP_ZERO_COPY
+            SNMP_ERROR_RESPONSE response = handlePacketInPlace(_packetBuffer, packetLength, &responseLength, MAX_SNMP_PACKET_LENGTH, callbacks, callbacksCount, _community, _readOnlyCommunity, informCallback, (void*)this);
+#else
             SNMP_ERROR_RESPONSE response = handlePacket(_packetBuffer, packetLength, &responseLength, MAX_SNMP_PACKET_LENGTH, callbacks, callbacksCount, _community, _readOnlyCommunity, informCallback, (void*)this);
+#endif
             SNMP_LOGI("loop: handlePacket -> ret=%d, responseLength=%d\n", (int)response, responseLength);
             if(response > 0 && response != SNMP_INFORM_RESPONSE_OCCURRED){
                 SNMP_LOGI("loop: UDP TX beginPacket(remote=%s:%d) write=%d B ...",

@@ -1,6 +1,7 @@
 # Build artifacts
 tests/build/
 tests/build-nouptime/
+tests/build-nozc/
 *.o
 *.d
 *.a
@@ -27,3 +28,6 @@ tests/build-nouptime/
 __pycache__/
 *.pyc
 
+
+# Internal test tooling and records — never public
+.internal_test/

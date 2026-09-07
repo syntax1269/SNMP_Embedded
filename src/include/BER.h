@@ -243,18 +243,29 @@ typedef int SNMP_BUFFER_ENCODE_ERROR;
 class BER_CONTAINER {
   public:
     BER_CONTAINER(ASN_TYPE type) : _type(type){}
-    virtual ~BER_CONTAINER()= default;
-
-    ASN_TYPE _type;
+    virtual ~BER_CONTAINER()= default;    ASN_TYPE _type;
     int _length = 0;
 
-  protected:
+#ifdef COMPILING_TESTS
+    /* Host-test shim: public pass-through to the protected serialise so
+     * byte-equivalence tests (v3.4.0 Phase 3 BerWriter vs containers) can
+     * invoke any subclass's encoder directly.  Compiled out of production. */
+    int testSerialise(uint8_t* buf, size_t max_len){ return serialise(buf, max_len); }
+#endif
+
+    /* v3.4.0 Phase 4: public pass-through to the protected serialise() for
+     * the zero-copy response builder (a free function outside the class
+     * hierarchy, compiled only under SNMP_ZERO_COPY=1).  Byte-identical to
+     * serialise(); virtual dispatch reaches each subclass's encoder. */
+    int wireSerialise(uint8_t* buf, size_t max_len){ return serialise(buf, max_len); }
     // Serialise object in BER notation into buf, with a maximum size of max_len; returns number of bytes used
     virtual int serialise(uint8_t* buf, size_t max_len);
     virtual int serialise(uint8_t* buf, size_t max_len, size_t known_length);
 
     // returns number of bytes used from buf, limited by max_len, return -1 if failed to parse
     virtual int fromBuffer(const uint8_t *buf, size_t max_len);
+
+protected:
 
     friend class ComplexType;
     template<typename U, typename... Args> friend U* asn_new(Args&&... args);
@@ -382,6 +393,12 @@ class OIDType: public BER_CONTAINER {
 
     const char* string();
     bool valid = false;
+
+    /* v3.4.0: read-only access to the ENCODED OID bytes (data[0] == 0x2b).
+     * Phase 2 zero-copy dispatch matches request OIDs by memcmp on these
+     * bytes instead of rendering dotted strings. */
+    const uint8_t* encodedData() const { return data; }
+    int encodedLen() const { return dataLen; }
 
     bool equals(const std::shared_ptr<OIDType> oid) const {
         return this->dataLen == oid->dataLen &&

@@ -9,6 +9,7 @@
 #include "include/SNMPPacket.h"
 #include "include/ValueCallbacks.h"
 #include "include/SNMPParser.h"
+#include "include/BERView.h"   /* v3.4.0 phase 1: zero-copy view equivalence tests */
 
 #include "SNMPTrap.h"
 #include "SNMP_Embedded.h"   /* v3.3.4: SNMPAgent / RFC1213Config for the system-group tests */
@@ -297,6 +298,97 @@ TEST_CASE( "Test Encoding/Decoding packet", "[snmp]" ) {
         REQUIRE( packet->varbindList[4].type == ASN_TYPE::INTEGER );
         REQUIRE( static_cast<IntegerType*>(packet->varbindList[4].value)->_value == -420000 );
 }
+
+#if SNMP_ZERO_COPY
+TEST_CASE( "v3.4.0 phase4: in-place handler is byte-equivalent to classic path", "[snmp][zerocopy]" ){
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback integer(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = &integer;
+
+    SNMPPacket* request = GenerateTestSNMPRequestPacket();
+    uint8_t classicBuffer[800] = {0};
+    uint8_t zeroCopyBuffer[800] = {0};
+    int requestLength = request->serialiseInto(classicBuffer, sizeof(classicBuffer));
+    REQUIRE( requestLength > 0 );
+    memcpy(zeroCopyBuffer, classicBuffer, (size_t)requestLength);
+
+    int classicLength = 0;
+    int zeroCopyLength = 0;
+    SNMP_ERROR_RESPONSE classicResult = handlePacket(
+        classicBuffer, requestLength, &classicLength, sizeof(classicBuffer),
+        callbacks, callbacksCount, "public", "private");
+    SNMP_ERROR_RESPONSE zeroCopyResult = handlePacketInPlace(
+        zeroCopyBuffer, requestLength, &zeroCopyLength, sizeof(zeroCopyBuffer),
+        callbacks, callbacksCount, "public", "private");
+
+    REQUIRE( zeroCopyResult == classicResult );
+    REQUIRE( zeroCopyLength == classicLength );
+    REQUIRE( memcmp(zeroCopyBuffer, classicBuffer, (size_t)classicLength) == 0 );
+}
+
+TEST_CASE( "v3.4.0 phase4: zero-copy GETNEXT, GETBULK, SET and tooBig parity", "[snmp][zerocopy]" ){
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int value = 7;
+    IntegerCallback first(new SortableOIDType(".1.3.6.1.4.1.5.1"), &value);
+    IntegerCallback second(new SortableOIDType(".1.3.6.1.4.1.5.2"), &value);
+    second.isSettable = true;
+    callbacks[callbacksCount++] = &first;
+    callbacks[callbacksCount++] = &second;
+    sort_handlers(callbacks, callbacksCount);
+
+    auto compare = [&](SNMPPacket* request, int maxPacketSize){
+        uint8_t classicBuffer[800] = {0};
+        uint8_t zeroCopyBuffer[800] = {0};
+        int requestLength = request->serialiseInto(classicBuffer, sizeof(classicBuffer));
+        REQUIRE( requestLength > 0 );
+        memcpy(zeroCopyBuffer, classicBuffer, (size_t)requestLength);
+        int classicLength = 0;
+        int zeroCopyLength = 0;
+        SNMP_ERROR_RESPONSE classicResult = handlePacket(
+            classicBuffer, requestLength, &classicLength, maxPacketSize,
+            callbacks, callbacksCount, "public", "public");
+        SNMP_ERROR_RESPONSE zeroCopyResult = handlePacketInPlace(
+            zeroCopyBuffer, requestLength, &zeroCopyLength, maxPacketSize,
+            callbacks, callbacksCount, "public", "public");
+        REQUIRE( zeroCopyResult == classicResult );
+        REQUIRE( zeroCopyLength == classicLength );
+        REQUIRE( memcmp(zeroCopyBuffer, classicBuffer, (size_t)classicLength) == 0 );
+    };
+
+    SECTION( "GETNEXT" ){
+        SNMPPacket* request = GenerateTestSNMPRequestPacket();
+        request->setPDUType(GetNextRequestPDU);
+        compare(request, sizeof(uint8_t) * 800);
+    }
+
+    SECTION( "GETBULK" ){
+        SNMPPacket* request = GenerateTestSNMPRequestPacket();
+        request->pop_back();
+        request->pop_back();
+        request->pop_back();
+        request->setVersion(SNMP_VERSION_2C);
+        request->setPDUType(GetBulkRequestPDU);
+        request->errorStatus.nonRepeaters = 0;
+        request->errorIndex.maxRepititions = 2;
+        compare(request, sizeof(uint8_t) * 800);
+    }
+
+    SECTION( "SET" ){
+        SNMPPacket* request = GenerateTestSNMPRequestPacket();
+        request->setPDUType(SetRequestPDU);
+        compare(request, sizeof(uint8_t) * 800);
+    }
+
+    SECTION( "tooBig" ){
+        SNMPPacket* request = GenerateTestSNMPRequestPacket();
+        request->setPDUType(GetRequestPDU);
+        compare(request, 64);
+    }
+}
+#endif
 
 TEST_CASE( "Test GetRequestPDU", "[snmp]" ){
     ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
@@ -1359,3 +1451,680 @@ TEST_CASE( "v3.3.6 inform ack callback: fires for matched responses with respond
     REQUIRE( SNMPAgent::testAgentsCount() == 0 );
     REQUIRE( ASNPool::doubleReleaseAlarms == baseAlarms );
 }
+
+#if SNMP_ZERO_COPY
+/* ==========================================================================
+ * v3.4.0 Phase 1 — zero-copy BER view equivalence tests.
+ *
+ * A canonical reference packet is byte-for-byte identical to the fixture
+ * generator's get_sysdescr_v2c.bin (.internal_test/baseline_v340_phase0/
+ * fixtures/) — same generator function shapes, same encoding.  The header
+ * walk (snmp_ber_peek_packet) must agree with the owning container parse
+ * (SNMPPacket::parseFrom) on version, community, PDU type, request-id,
+ * varbind count, and decoded value bytes — plus hold hard invariants on
+ * every structural edge case: truncation, unknown types, embedded NULs,
+ * OID subtree slice equality.
+ * ========================================================================== */
+
+/* Minimal BER builder with COMPUTED lengths (mirrors gen_fixtures.py's
+ * tlv()/integer()/oid_arc_list()) — hand-typed length bytes are how the
+ * first draft of these fixtures went wrong. */
+namespace berfix {
+    static size_t putLen(uint8_t* p, size_t L){
+        if(L < 0x80){ p[0]=(uint8_t)L; return 1; }
+        if(L < 0x100){ p[0]=0x81; p[1]=(uint8_t)L; return 2; }
+        p[0]=0x82; p[1]=(uint8_t)(L>>8); p[2]=(uint8_t)(L&0xFF); return 3;
+    }
+    /* TLV from raw content. Returns bytes written. */
+    static size_t tlv(uint8_t* p, uint8_t tag, const uint8_t* c, size_t cl){
+        p[0]=tag; size_t n=putLen(p+1,cl); memcpy(p+1+n,c,cl); return 1+n+cl;
+    }
+    /* INTEGER TLV, non-negative-safe minimal big-endian. */
+    static size_t tlvInt(uint8_t* p, long v){
+        uint8_t c[5]; size_t cl=0;
+        if(v==0){ c[cl++]=0; }
+        else { uint8_t tmp[5]; size_t n=0; unsigned long u=(unsigned long)v;
+            while(u){ tmp[n++]=(uint8_t)(u&0xFF); u>>=8; }
+            for(size_t i=n;i>0;i--) c[cl++]=tmp[i-1];
+            if(c[0]&0x80){ memmove(c+1,c,cl); c[0]=0; cl++; } }
+        return tlv(p,0x02,c,cl);
+    }
+    /* OCTET STRING TLV. */
+    static size_t tlvOctets(uint8_t* p, const char* s, size_t len){
+        return tlv(p,0x04,(const uint8_t*)s,len);
+    }
+    /* OID TLV from an arc list (base-128 encoding, arcs after the first two). */
+    static size_t tlvOid(uint8_t* p, const long* arcs, int n){
+        uint8_t c[40]; size_t cl=0;
+        c[cl++]=(uint8_t)(40*arcs[0]+arcs[1]);
+        for(int i=2;i<n;i++){
+            long a=arcs[i];
+            if(a<0x80){ c[cl++]=(uint8_t)a; }
+            else { uint8_t tmp[6]; size_t t=0; while(a){ tmp[t++]=(uint8_t)((a&0x7F)|0x80); a>>=7; }
+                   tmp[0]&=0x7F; while(t) c[cl++]=tmp[--t]; }
+        }
+        return tlv(p,0x06,c,cl);
+    }
+    /* varbind SEQUENCE { OID, valueTLV(value bytes) }. valueRaw = raw content bytes of the value TLV. */
+    static size_t varbindRaw(uint8_t* p, const uint8_t* oidContent, size_t oidLen,
+                             uint8_t valueTag, const uint8_t* valueContent, size_t valueLen){
+        uint8_t body[80]; size_t bl=0;
+        bl += tlv(body, 0x06, oidContent, oidLen);
+        bl += tlv(body+bl, valueTag, valueContent, valueLen);
+        return tlv(p, 0x30, body, bl);
+    }
+    /* Complete v2c message: SEQUENCE { ver, community, pduTag{ rid, e, i, vbList{ vbs } } }. */
+    static size_t message(uint8_t* p, const char* community, uint8_t pduTag, long rid,
+                          const uint8_t* vbs, size_t vbsLen, long errStatus=0, long errIndex=0){
+        uint8_t body[512]; size_t bl=0;
+        bl += tlvInt(body+bl, 1);                            /* version = v2c */
+        bl += tlvOctets(body+bl, community, strlen(community));
+        uint8_t pduBody[384]; size_t pl=0;
+        pl += tlvInt(pduBody+pl, rid);
+        pl += tlvInt(pduBody+pl, errStatus);
+        pl += tlvInt(pduBody+pl, errIndex);
+        pl += tlv(pduBody+pl, 0x30, vbs, vbsLen);            /* varbind-LIST envelope around the varbinds */
+        bl += tlv(body+bl, pduTag, pduBody, pl);
+        return tlv(p, 0x30, body, bl);
+    }
+    static const uint8_t kSysDescr[] = { 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00 };
+}
+
+TEST_CASE( "v3.4.0 phase1: zero-copy BER view equals container parse" ){
+    REQUIRE( SNMP_ZERO_COPY == 1 );   /* the tests below are meaningless without the view walk */
+
+    /* ---- canonical reference packet: GET sysDescr.0, community "public", v2c
+     *      (byte-identical to fixtures/get_sysdescr_v2c.bin from
+     *      gen_fixtures.py — same tlv()/integer()/oid_arc_list() encoding) ---- */
+    uint8_t refPkt[] = {
+        0x30, 0x29,                         /* SEQUENCE (41 B)                    */
+        0x02, 0x01, 0x01,                   /*   INTEGER version = 1 (v2c)        */
+        0x04, 0x06, 'p','u','b','l','i','c',/*   OCTET STRING community           */
+        0xA0, 0x1C,                         /*   GetRequest-PDU (28 B)            */
+        0x02, 0x04, 0x2A, 0x8C, 0x3F, 0x10, /*     request-id 0x2A8C3F10          */
+        0x02, 0x01, 0x00,                   /*     error-status 0                 */
+        0x02, 0x01, 0x00,                   /*     error-index  0                 */
+        0x30, 0x0E,                         /*     varbind-list (14 B)            */
+        0x30, 0x0C,                         /*       varbind SEQUENCE (12 B)      */
+        0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00,  /* OID .1.3.6.1.2.1.1.1.0 */
+        0x05, 0x00                          /*       NULL value                   */
+    };
+    const size_t refLen = sizeof(refPkt);
+
+    SECTION( "header view decodes every field" ){
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(refPkt, refLen, &hv) == true );
+        REQUIRE( hv.version      == 1 );
+        REQUIRE( hv.communityLen == 6 );
+        REQUIRE( memcmp(hv.community, "public", 6) == 0 );
+        REQUIRE( hv.pduType      == GetRequestPDU );
+        REQUIRE( (uint32_t)hv.requestID == 0x2A8C3F10u );
+        REQUIRE( hv.errorStatus  == 0 );
+        REQUIRE( hv.errorIndex   == 0 );
+        REQUIRE( hv.varbindCount == 1 );
+        REQUIRE( hv.varbindsTruncated == false );
+    }
+
+    SECTION( "varbind slices are exact and equal the container OID" ){
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(refPkt, refLen, &hv) == true );
+
+        const uint8_t expectOid[] = { 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00 };
+        REQUIRE( hv.vbs[0].oidLen == sizeof(expectOid) );
+        REQUIRE( memcmp(hv.vbs[0].oid, expectOid, sizeof(expectOid)) == 0 );
+        REQUIRE( hv.vbs[0].valueType == NULLTYPE );
+        REQUIRE( hv.vbs[0].valueLen  == 0 );
+
+        /* slice points INSIDE the caller's buffer (zero-copy property) */
+        REQUIRE( hv.vbs[0].oid >= refPkt );
+        REQUIRE( hv.vbs[0].oid <  refPkt + refLen );
+
+        /* cross-check: the owning path's OID encodes to the same bytes */
+        OIDType* ref = asn_new<OIDType>(".1.3.6.1.2.1.1.1.0");
+        REQUIRE( ref != nullptr );
+        REQUIRE( (size_t)ref->encodedLen() == (size_t)hv.vbs[0].oidLen );
+        REQUIRE( memcmp(ref->encodedData(), hv.vbs[0].oid, (size_t)ref->encodedLen()) == 0 );
+        asn_delete(ref);
+    }
+
+    SECTION( "view walk agrees with the owning container parse" ){
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(refPkt, refLen, &hv) == true );
+
+        SNMPPacket packet;
+        REQUIRE( packet.parseFrom(refPkt, refLen) == SNMP_ERROR_OK );
+
+        REQUIRE( (int)packet.snmpVersion == hv.version );
+        REQUIRE( strcmp(packet.communityString, "public") == 0 );
+        REQUIRE( packet.communityString[hv.communityLen] == 0 );
+        REQUIRE( packet.packetPDUType == hv.pduType );
+        REQUIRE( packet.requestID == (snmp_request_id_t)hv.requestID );
+        REQUIRE( packet.size()    == hv.varbindCount );
+        REQUIRE( packet.varbindList[0].oid != nullptr );
+        REQUIRE( packet.varbindList[0].oid->encodedLen() == (int)hv.vbs[0].oidLen );
+        REQUIRE( memcmp(packet.varbindList[0].oid->encodedData(), hv.vbs[0].oid, (size_t)hv.vbs[0].oidLen) == 0 );
+    }
+
+    SECTION( "truncated packets are rejected, never read past the buffer" ){
+        SnmpHeaderView hv;
+        /* every strict prefix of the reference packet must fail the walk */
+        for( size_t cut = 0; cut < refLen; cut++ ){
+            REQUIRE( snmp_ber_peek_packet(refPkt, cut, &hv) == false );
+        }
+        /* truncated-inside-last-TLV (fixture edge_truncated_mid_tlv shape) */
+        REQUIRE( snmp_ber_peek_packet(refPkt, refLen - 7, &hv) == false );
+    }
+
+    SECTION( "unknown value type is structurally valid for the view walk" ){
+        /* tag 0x7F value: view walk treats it as an opaque slice; the
+         * decision to reject belongs to dispatch (phase 2), not decode */
+        uint8_t vbs[32]; size_t vl = 0;
+        const uint8_t weird[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+        vl += berfix::varbindRaw(vbs+vl, berfix::kSysDescr, sizeof(berfix::kSysDescr), 0x7F, weird, 4);
+        uint8_t pkt[96];
+        size_t n = berfix::message(pkt, "public", 0xA0, 5, vbs, vl);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.varbindCount == 1 );
+        REQUIRE( hv.vbs[0].valueType == 0x7F );
+        REQUIRE( hv.vbs[0].valueLen  == 4 );
+        REQUIRE( hv.vbs[0].value[0]  == 0xDE );
+        REQUIRE( hv.vbs[0].value[2]  == 0xBE );
+    }
+
+    SECTION( "embedded NULs ride through the slice by explicit length" ){
+        /* OID .1.3.6.1.4.1.52420 + octet string "a\0" — 2-byte base-128 arc
+         * and an embedded NUL carried by explicit length, no strlen */
+        const long arcs[] = { 1, 3, 6, 1, 4, 1, 52420 };
+        uint8_t oidC[12];
+        uint8_t vbArea[48]; size_t vl = 0;
+        {
+            uint8_t one[24];
+            size_t oneLen = berfix::tlvOid(one, arcs, 7);
+            vl += berfix::varbindRaw(vbArea+vl, one+2, oneLen-2, 0x04, (const uint8_t*)"a\0", 2);
+        }
+        (void)oidC;
+        uint8_t pkt[96];
+        size_t n = berfix::message(pkt, "private", 0xA3, 2, vbArea, vl);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.pduType == SetRequestPDU );
+        REQUIRE( hv.varbindCount == 1 );
+        REQUIRE( hv.vbs[0].valueType == STRING );
+        REQUIRE( hv.vbs[0].valueLen  == 2 );
+        REQUIRE( hv.vbs[0].value[0]  == 'a' );
+        REQUIRE( hv.vbs[0].value[1]  == 0x00 );   /* NUL carried — no strlen anywhere */
+        /* 2-byte base-128 arc: 52420 = 3*16384 + 25*128 + 68 -> 0x83 0x99 0x44 */
+        const uint8_t expectOid[] = { 0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0x99, 0x44 };
+        REQUIRE( hv.vbs[0].oidLen == sizeof(expectOid) );
+        REQUIRE( memcmp(hv.vbs[0].oid, expectOid, sizeof(expectOid)) == 0 );
+    }
+
+    SECTION( "GETBULK header fields decode (errorStatus carries nonRepeaters)" ){
+        uint8_t vbs[32]; size_t vl = 0;
+        vl += berfix::varbindRaw(vbs+vl, berfix::kSysDescr, sizeof(berfix::kSysDescr), 0x05, nullptr, 0);
+        uint8_t pkt[96];
+        /* union view: errStatus slot carries nonRepeaters, errIndex slot maxRepetitions */
+        size_t n = berfix::message(pkt, "public", 0xA5, 0x55667788L, vbs, vl, 0, 4);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.pduType == GetBulkRequestPDU );
+        REQUIRE( hv.errorStatus == 0 );   /* union view: nonRepeaters */
+        REQUIRE( hv.errorIndex  == 4 );   /* union view: maxRepetitions */
+        REQUIRE( hv.varbindCount == 1 );
+    }
+
+    SECTION( "8-varbind request: exact count, slices recorded to the cap" ){
+        /* 8x varbind( sysX.0, NULL ), sysX = 1..8 — the edge_8varbind_p1400 shape */
+        uint8_t vbArea[192]; size_t vl = 0;
+        for( int k = 1; k <= 8; k++ ){
+            uint8_t oidC[12];
+            oidC[0]=0x2B; oidC[1]=0x06; oidC[2]=0x01; oidC[3]=0x02; oidC[4]=0x01;
+            oidC[5]=0x01; oidC[6]=(uint8_t)k; oidC[7]=0x00;
+            vl += berfix::varbindRaw(vbArea+vl, oidC, 8, 0x05, nullptr, 0);
+        }
+        uint8_t pkt[256];
+        size_t n = berfix::message(pkt, "public", 0xA0, 3, vbArea, vl);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.varbindCount == 8 );
+        REQUIRE( hv.varbindsTruncated == false ); /* 8 <= SNMP_ZC_MAX_VARBINDS(16) */
+        for( int k = 0; k < 8; k++ ){
+            REQUIRE( hv.vbs[k].oid[6] == (uint8_t)(k + 1) );   /* sysX index rides in-slice */
+            REQUIRE( hv.vbs[k].valueType == NULLTYPE );
+        }
+    }
+
+    SECTION( "indefinite length and oversized length fields are rejected" ){
+        uint8_t indef[] = { 0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00 };
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(indef, sizeof(indef), &hv) == false );
+
+        uint8_t huge[] = { 0x30, 0x85, 0xFF, 0xFF, 0xFF, 0xFF, 0x02 };
+        REQUIRE( snmp_ber_peek_packet(huge, sizeof(huge), &hv) == false );
+
+        uint8_t maniac[] = { 0x30, 0x89, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A };
+        REQUIRE( snmp_ber_peek_packet(maniac, sizeof(maniac), &hv) == false );
+    }
+
+    SECTION( "bad version rejected exactly like the container path" ){
+        /* version = 3 (SNMPv3-shaped): parsePacket rejects with
+         * SNMP_PARSE_ERROR_AT_STATE(SNMPVERSION); the view walk fails. */
+        uint8_t pkt[] = {
+            0x30, 0x28,
+            0x02, 0x01, 0x03,                 /* version 3 */
+            0x04, 0x06, 'p','u','b','l','i','c',
+            0xA0, 0x1B,
+            0x02, 0x01, 0x06,
+            0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+            0x30, 0x0D,
+            0x30, 0x0B,
+            0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00,
+            0x05, 0x00
+        };
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, sizeof(pkt), &hv) == false );
+
+        SNMPPacket packet;
+        int rc = packet.parseFrom(pkt, sizeof(pkt));
+        REQUIRE( rc != SNMP_ERROR_OK );   /* both paths agree: reject */
+    }
+
+    SECTION( "garbage buffer rejected (magic-byte parity with parseFrom)" ){
+        uint8_t junk[] = { 0x31, 0x05, 0x02, 0x01, 0x01, 0x00, 0x00 };
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(junk, sizeof(junk), &hv) == false );
+
+        SNMPPacket packet;
+        REQUIRE( packet.parseFrom(junk, sizeof(junk)) == SNMP_PARSE_ERROR_MAGIC_BYTE );
+    }
+
+    SECTION( "multi-varbind view matches container OID list element-wise" ){
+        uint8_t vbArea[160]; size_t vl = 0;
+        const char* oids[3] = { ".1.3.6.1.2.1.1.1.0", ".1.3.6.1.4.1.52420.1", ".1.3.6.1.2.1.1.3.0" };
+        for( int i = 0; i < 3; i++ ){
+            OIDType* o = asn_new<OIDType>(oids[i]);
+            REQUIRE( o != nullptr );
+            vl += berfix::varbindRaw(vbArea+vl, o->encodedData(), (size_t)o->encodedLen(), 0x05, nullptr, 0);
+            asn_delete(o);
+        }
+        uint8_t pkt[256];
+        size_t n = berfix::message(pkt, "public", 0xA0, 0xDEADBEEFL, vbArea, vl);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.varbindCount == 3 );
+        REQUIRE( (uint32_t)hv.requestID == 0xDEADBEEFu );
+
+        /* owning parse of the same buffer */
+        SNMPPacket packet;
+        REQUIRE( packet.parseFrom(pkt, n) == SNMP_ERROR_OK );
+        REQUIRE( packet.size() == 3 );
+        for( int i = 0; i < 3; i++ ){
+            REQUIRE( packet.varbindList[i].oid != nullptr );
+            REQUIRE( packet.varbindList[i].oid->encodedLen() == (int)hv.vbs[i].oidLen );
+            REQUIRE( memcmp(packet.varbindList[i].oid->encodedData(), hv.vbs[i].oid,
+                            (size_t)hv.vbs[i].oidLen) == 0 );
+        }
+    }
+}
+
+#endif /* SNMP_ZERO_COPY */
+
+#if SNMP_ZERO_COPY
+/* ==========================================================================
+ * v3.4.0 Phase 3 — BerWriter direct serialization equivalence.
+ *
+ * Every typed writer must produce BYTE-IDENTICAL output to the container
+ * serialise() forms (the wire contract), scopes must encode lengths
+ * identically (short/1-byte/2-byte forms), and the exact fit invariant
+ * must hold: put*() failing marks the writer sticky-failed and the exact
+ * length() is the truth about what fits.
+ * ========================================================================== */
+TEST_CASE( "v3.4.0 phase3: BerWriter equals container serialise" ){
+
+    SECTION( "putInteger matches IntegerType::serialise (always 4-byte form)" ){
+        const long vals[] = { 0, 1, -1, 42, -42, 23, -420000, 2147483647L, (long)-2147483648 };
+        for( long v : vals ){
+            uint8_t w[32]; BerWriter wr(w, sizeof(w));
+            REQUIRE( wr.putInteger(v) );
+            REQUIRE( wr.length() == 6 );
+
+            IntegerType* it = asn_new<IntegerType>((int)v);
+            REQUIRE( it != nullptr );
+            uint8_t c[32];
+            int n = it->testSerialise(c, sizeof(c));
+            REQUIRE( n > 0 );
+            REQUIRE( (size_t)n == wr.length() );
+            REQUIRE( memcmp(w, c, (size_t)n) == 0 );
+            asn_delete(it);
+        }
+    }
+
+    SECTION( "putNull matches NullType::serialise" ){
+        uint8_t w[8]; BerWriter wr(w, sizeof(w));
+        REQUIRE( wr.putNull(0x05) );
+        REQUIRE( wr.length() == 2 );
+        REQUIRE( w[0] == 0x05 ); REQUIRE( w[1] == 0x00 );
+
+        NullType* nt = asn_new<NullType>();
+        uint8_t c[8]; int n = nt->testSerialise(c, sizeof(c));
+        REQUIRE( n == 2 );
+        REQUIRE( memcmp(w, c, 2) == 0 );
+        asn_delete(nt);
+
+        /* implicit-null exception tags ride the same 2-byte shape */
+        uint8_t w2[8]; BerWriter wr2(w2, sizeof(w2));
+        REQUIRE( wr2.putNull(ENDOFMIBVIEW) );
+        REQUIRE( w2[0] == 0x82 ); REQUIRE( w2[1] == 0x00 );
+    }
+
+    SECTION( "putOIDContent matches OIDType::serialise" ){
+        OIDType* o = asn_new<OIDType>(".1.3.6.1.4.1.52420.9999999");
+        REQUIRE( o != nullptr );
+        uint8_t c[64];
+        int n = o->testSerialise(c, sizeof(c));
+        REQUIRE( n > 0 );
+
+        uint8_t w[64]; BerWriter wr(w, sizeof(w));
+        REQUIRE( wr.putOIDContent(o->encodedData(), (size_t)o->encodedLen()) );
+        REQUIRE( wr.length() == (size_t)n );
+        REQUIRE( memcmp(w, c, (size_t)n) == 0 );
+        asn_delete(o);
+    }
+
+    SECTION( "putOctets matches OctetType::serialise (incl. embedded NUL)" ){
+        const uint8_t payload[] = { 'a', 0x00, 'b', 0x00, 'c' };
+        OctetType* ot = asn_new<OctetType>((const char*)payload, sizeof(payload));
+        REQUIRE( ot != nullptr );
+        uint8_t c[64];
+        int n = ot->testSerialise(c, sizeof(c));
+        REQUIRE( n > 0 );
+
+        uint8_t w[64]; BerWriter wr(w, sizeof(w));
+        REQUIRE( wr.putOctets(0x04, payload, sizeof(payload)) );
+        REQUIRE( wr.length() == (size_t)n );
+        REQUIRE( memcmp(w, c, (size_t)n) == 0 );
+        asn_delete(ot);
+    }
+
+    SECTION( "scopes produce identical lengths across all three length forms" ){
+        /* short form (<128), 0x81 form (<256), 0x82 form (>=256).
+         * 256 is the max: the container OctetType ctor clamps string content
+         * to SNMP_MAX_STRING_LEN (256), so the writer payload is clamped to
+         * the same to keep the comparison apples-to-apples. */
+        const size_t contentSizes[] = { 3, 130, 256 };
+        for( size_t cs : contentSizes ){
+            REQUIRE( cs <= 256 );
+            uint8_t content[256];
+            for( size_t i = 0; i < cs; i++ ) content[i] = (uint8_t)(i & 0xFF);
+
+            /* writer: scope of one octet-string TLV */
+            uint8_t w[512]; BerWriter wr(w, sizeof(w));
+            BerWriter::Marker m;
+            REQUIRE( wr.beginScope(0x30, &m) );
+            REQUIRE( wr.putOctets(0x04, content, cs) );
+            REQUIRE( wr.endScope(&m) );
+            (void)0;
+
+            /* container: ComplexType{ OctetType } serialised */
+            ComplexType* ct = asn_new<ComplexType>(STRUCTURE);
+            REQUIRE( ct != nullptr );
+            ct->_ownsChildren = true;
+            OctetType* child = asn_new<OctetType>((const char*)content, cs);
+            REQUIRE( child != nullptr );
+            ct->addValueToListRaw(child);
+            uint8_t c[512];
+            int n = ct->serialise(c, sizeof(c));
+            REQUIRE( n > 0 );
+            REQUIRE( wr.length() == (size_t)n );
+            REQUIRE( memcmp(w, c, (size_t)n) == 0 );
+            asn_delete(ct);
+        }
+    }
+
+    SECTION( "nested scopes match a full ComplexType tree" ){
+        uint8_t w[256]; BerWriter wr(w, sizeof(w));
+        BerWriter::Marker root, pdu, vbl, vb;
+        REQUIRE( wr.beginScope(0x30, &root) );
+        REQUIRE( wr.putInteger(1) );                       /* version */
+        REQUIRE( wr.putOctets(0x04, (const uint8_t*)"public", 6) );
+        REQUIRE( wr.beginScope(0xA2, &pdu) );              /* GetResponse */
+        REQUIRE( wr.putInteger(0x2A8C3F10L) );
+        REQUIRE( wr.putInteger(0) );
+        REQUIRE( wr.putInteger(0) );
+        REQUIRE( wr.beginScope(0x30, &vbl) );
+        REQUIRE( wr.beginScope(0x30, &vb) );
+        REQUIRE( wr.putOIDContent(berfix::kSysDescr, sizeof(berfix::kSysDescr)) );
+        REQUIRE( wr.putInteger(23) );
+        REQUIRE( wr.endScope(&vb) );
+        REQUIRE( wr.endScope(&vbl) );
+        REQUIRE( wr.endScope(&pdu) );
+        REQUIRE( wr.endScope(&root) );
+
+        /* the same tree through containers */
+        ComplexType* r = asn_new<ComplexType>(STRUCTURE);
+        ComplexType* p = asn_new<ComplexType>(GetResponsePDU);
+        ComplexType* lst = asn_new<ComplexType>(STRUCTURE);
+        ComplexType* one = asn_new<ComplexType>(STRUCTURE);
+        REQUIRE( r != nullptr );
+        REQUIRE( p != nullptr );
+        REQUIRE( lst != nullptr );
+        REQUIRE( one != nullptr );
+        r->_ownsChildren = true; p->_ownsChildren = true; lst->_ownsChildren = true; one->_ownsChildren = true;
+        r->addValueToListRaw(asn_new<IntegerType>(1));
+        r->addValueToListRaw(asn_new<OctetType>("public"));
+        p->addValueToListRaw(asn_new<IntegerType>(0x2A8C3F10));
+        p->addValueToListRaw(asn_new<IntegerType>(0));
+        p->addValueToListRaw(asn_new<IntegerType>(0));
+        one->addValueToListRaw(asn_new<OIDType>(".1.3.6.1.2.1.1.1.0"));
+        one->addValueToListRaw(asn_new<IntegerType>(23));
+        lst->addValueToListRaw(one);
+        p->addValueToListRaw(lst);
+        r->addValueToListRaw(p);
+        uint8_t c[256];
+        int n = r->testSerialise(c, sizeof(c));
+        REQUIRE( n > 0 );
+        REQUIRE( wr.length() == (size_t)n );
+        REQUIRE( memcmp(w, c, (size_t)n) == 0 );
+        asn_delete(r);
+
+        /* and the walk must parse the writer's output as a valid response */
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(w, wr.length(), &hv) == true );
+        REQUIRE( hv.pduType == GetResponsePDU );
+        REQUIRE( hv.varbindCount == 1 );
+        REQUIRE( memcmp(hv.vbs[0].oid, berfix::kSysDescr, sizeof(berfix::kSysDescr)) == 0 );
+    }
+
+    SECTION( "exact fit invariant: overflow is sticky, atomic, and length() is exact" ){
+        uint8_t tiny[8];
+        BerWriter wr(tiny, sizeof(tiny));
+        REQUIRE( wr.putInteger(7) );               /* 6 B */
+        REQUIRE( wr.length() == 6 );
+        REQUIRE( wr.putOctets(0x04, (const uint8_t*)"0123456789", 10) == false );  /* would exceed */
+        REQUIRE( wr.full() );                       /* sticky */
+        REQUIRE( wr.length() == 6 );                /* atomic: nothing partial written */
+        REQUIRE( wr.putInteger(0) == false );       /* further puts fail */
+        REQUIRE( wr.length() == 6 );
+    }
+
+    SECTION( "boundary fit: exactly-full write succeeds, one extra byte fails" ){
+        uint8_t buf[6];
+        BerWriter wr(buf, sizeof(buf));
+        REQUIRE( wr.putInteger(1) );               /* exactly 6 B */
+        REQUIRE( wr.length() == 6 );
+        REQUIRE( wr.ok() );
+
+        uint8_t buf2[7];
+        BerWriter wr2(buf2, sizeof(buf2));
+        REQUIRE( wr2.putInteger(1) );
+        REQUIRE( wr2.putByte(0xAB) );              /* 7th byte fits */
+        REQUIRE( wr2.length() == 7 );
+        BerWriter wr3(buf2, 7);
+        REQUIRE( wr3.putInteger(1) );
+        REQUIRE( wr3.putTLVHeader(0x04, 1) == false );  /* 2 more bytes: fail */
+    }
+
+    SECTION( "putTLVView re-emits a decoded OID slice verbatim" ){
+        uint8_t vbs[32]; size_t vl = 0;
+        vl += berfix::varbindRaw(vbs+vl, berfix::kSysDescr, sizeof(berfix::kSysDescr), 0x05, nullptr, 0);
+        uint8_t pkt[96];
+        size_t n = berfix::message(pkt, "public", 0xA0, 9, vbs, vl);
+
+        SnmpHeaderView hv;
+        REQUIRE( snmp_ber_peek_packet(pkt, n, &hv) == true );
+        REQUIRE( hv.varbindCount == 1 );
+
+        /* rebuild the varbind's OID TLV via putTLVView over a fresh view */
+        BerView oidView;
+        oidView.ok = true;
+        oidView.tag = 0x06;
+        oidView.value = hv.vbs[0].oid;
+        oidView.len = hv.vbs[0].oidLen;
+        oidView.headerLen = 2;
+        oidView.totalLen = hv.vbs[0].oidLen + 2;
+
+        uint8_t w[64]; BerWriter wr(w, sizeof(w));
+        REQUIRE( wr.putTLVView(oidView) );
+        REQUIRE( wr.length() == (size_t)hv.vbs[0].oidLen + 2 );
+        /* byte-identical to the wire bytes AND to the container encode */
+        REQUIRE( w[0] == 0x06 );
+        REQUIRE( memcmp(w + 2, berfix::kSysDescr, sizeof(berfix::kSysDescr)) == 0 );
+        OIDType* o = asn_new<OIDType>(".1.3.6.1.2.1.1.1.0");
+        uint8_t c[64]; int cn = o->testSerialise(c, sizeof(c));
+        REQUIRE( (size_t)cn == wr.length() );
+        REQUIRE( memcmp(w, c, (size_t)cn) == 0 );
+        asn_delete(o);
+    }
+}
+#endif /* SNMP_ZERO_COPY */
+
+#if SNMP_ZERO_COPY
+/* ==========================================================================
+ * v3.4.0 Phase 2 — zero-copy dispatch on slices (measurement gate).
+ *
+ * findCallbackForSlice (Strategy A: encoded memcmp, selected by the gate;
+ * see PHASE2_EVIDENCE.md) must be a contract twin of the container
+ * findCallback(): identical results across exact matches, walk successors,
+ * subtree walk-starts, misses, and a randomized corpus of OID pairs — with
+ * zero-copy semantics (no container materialized for matching).
+ * ========================================================================== */
+TEST_CASE( "v3.4.0 phase2: slice dispatch equals container findCallback" ){
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int v1 = 1, v2 = 2, v3 = 3;
+
+    /* deliberately NOT pre-sorted; matching must not care, walk results must */
+    IntegerCallback* cbA = new IntegerCallback(new SortableOIDType(".1.3.6.1.2.1.1.1.0"), &v1);
+    IntegerCallback* cbB = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.52420.1"), &v2);
+    IntegerCallback* cbC = new IntegerCallback(new SortableOIDType(".1.3.6.1.2"), &v3);
+    callbacks[callbacksCount++] = cbA;
+    callbacks[callbacksCount++] = cbB;
+    callbacks[callbacksCount++] = cbC;
+    sort_handlers(callbacks, callbacksCount);
+
+    /* ownership for the corpus OIDs */
+    std::list<OIDType*> owned;
+    auto mkOID = [&](const char* s){ OIDType* o = asn_new<OIDType>(s); REQUIRE(o != nullptr); owned.push_back(o); return o; };
+    auto encOf = [](OIDType* o, const uint8_t** d, int* l){ *d = o->encodedData(); *l = o->encodedLen(); };
+
+    auto checkBoth = [&](ValueCallback* container, ValueCallback* slice, const char* what){
+        INFO(what);
+        REQUIRE( container == slice );
+    };
+
+    SECTION( "exact matches (no walk)" ){
+        const char* cases[] = { ".1.3.6.1.2.1.1.1.0", ".1.3.6.1.4.1.52420.1", ".1.3.6.1.2" };
+        for( const char* s : cases ){
+            OIDType* o = mkOID(s);
+            const uint8_t* d; int l; encOf(o, &d, &l);
+            checkBoth( ValueCallback::findCallback(callbacks, callbacksCount, o, false),
+                       ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, false),
+                       s );
+        }
+    }
+
+    SECTION( "misses return nullptr on both paths" ){
+        const char* cases[] = { ".1.3.6.1.2.1.1.1.1", ".1.3.6.1.4.1.52420.2", ".1.4", ".1.3.6.1.2.1.1.1" };
+        for( const char* s : cases ){
+            OIDType* o = mkOID(s);
+            const uint8_t* d; int l; encOf(o, &d, &l);
+            checkBoth( ValueCallback::findCallback(callbacks, callbacksCount, o, false),
+                       ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, false),
+                       s );
+        }
+    }
+
+    SECTION( "walk: exact match -> successor; above-root start -> first handler below" ){
+        struct W { const char* req; const char* expectContainer; };
+        W cases[] = {
+            { ".1.3.6.1.2.1.1.1.0", nullptr },           /* exact, last in subtree order: successor = cbB or null by roster */
+            { ".1.3.6.1.2",           nullptr },           /* exact root -> successor                          */
+            { ".1.3.6.1.2.1",         nullptr },           /* ABOVE root .1.3.6.1.2 -> first handler below it  */
+            { ".1.3.6.1",             nullptr },           /* above both roots                                 */
+            { ".1.3.6.1.4.1.52420",    nullptr }            /* above .1.3.6.1.4.1.52420.1                       */
+        };
+        for( W& w : cases ){
+            OIDType* o = mkOID(w.req);
+            const uint8_t* d; int l; encOf(o, &d, &l);
+            int fC = -1, fS = -1;
+            ValueCallback* rc = ValueCallback::findCallback(callbacks, callbacksCount, o, true, 0, &fC);
+            ValueCallback* rs = ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, true, 0, &fS);
+            checkBoth( rc, rs, w.req );
+            REQUIRE( fC == fS );
+            if( rc ){ REQUIRE( strcmp(rc->OID->string(), w.expectContainer ? w.expectContainer : rc->OID->string()) == 0 ); }
+        }
+        /* spot-check the two interesting shapes outright */
+        OIDType* above = mkOID(".1.3.6.1.2.1");
+        REQUIRE( ValueCallback::findCallback(callbacks, callbacksCount, above, true) == cbA );
+        const uint8_t* d; int l; encOf(above, &d, &l);
+        REQUIRE( ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, true) == cbA );
+    }
+
+    SECTION( "startAt continuation matches on both paths" ){
+        OIDType* o = mkOID(".1.3.6.1.2");
+        const uint8_t* d; int l; encOf(o, &d, &l);
+        int fC = -1, fS = -1;
+        REQUIRE( ValueCallback::findCallback(callbacks, callbacksCount, o, true, 0, &fC) != nullptr );
+        REQUIRE( ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, true, 0, &fS) != nullptr );
+        REQUIRE( fC == fS );
+        /* continue from foundAt: next successor, both paths agree */
+        OIDType* o2 = mkOID(".1.3.6.1.2");
+        int fC2 = -1, fS2 = -1;
+        ValueCallback* rc2 = ValueCallback::findCallback(callbacks, callbacksCount, o2, true, fC, &fC2);
+        ValueCallback* rs2 = ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, true, fS, &fS2);
+        checkBoth( rc2, rs2, "continuation" );
+        REQUIRE( fC2 == fS2 );
+    }
+
+    SECTION( "randomized corpus: 500 pairs agree on both paths" ){
+        srandom(0xC0FFEE);
+        for( int iter = 0; iter < 500; iter++ ){
+            /* random dotted request OID, 4..9 arcs under .1.3 */
+            char buf[96];
+            strcpy(buf, ".1.3.6");
+            int arcs = 4 + (int)(random() % 6);
+            for( int a = 0; a < arcs; a++ ){
+                snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), ".%ld", (long)(random() % 3 == 0 ? 52420 : (random() % 200)));
+            }
+            OIDType* o = mkOID(buf);
+            if(!o->valid) continue;
+            const uint8_t* d; int l; encOf(o, &d, &l);
+            bool walk = (iter & 1) == 0;
+            int fC = -1, fS = -1;
+            ValueCallback* rc = ValueCallback::findCallback(callbacks, callbacksCount, o, walk, 0, &fC);
+            ValueCallback* rs = ValueCallback::findCallbackForSlice(callbacks, callbacksCount, d, l, walk, 0, &fS);
+            REQUIRE( rc == rs );
+            REQUIRE( fC == fS );
+        }
+    }
+
+    for( OIDType* o : owned ) asn_delete(o);
+    delete cbA; delete cbB; delete cbC;
+}
+#endif /* SNMP_ZERO_COPY */
