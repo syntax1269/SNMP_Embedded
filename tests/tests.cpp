@@ -2139,3 +2139,307 @@ TEST_CASE( "v3.4.0 phase2: slice dispatch equals container findCallback" ){
     delete cbA; delete cbB; delete cbC;
 }
 #endif /* SNMP_ZERO_COPY */
+
+/* ==========================================================================
+ * v3.4.2 Phase 0 — per-packet heap-allocation census (Report_001 finding #1).
+ *
+ * Counts global operator new/malloc calls inside scoped windows around the
+ * packet hot path.  Requests are serialised OUTSIDE the window; all
+ * REQUIREs run OUTSIDE the window so Catch2's own allocations never pollute
+ * the counts.  This test is the before/after instrument for the AsnPtr
+ * migration: today it must report non-zero control-block traffic on both
+ * packet paths; after Phase 2 it must report ZERO for the library's own
+ * callbacks.
+ *
+ * Note: under COMPILING_TESTS asn_new() falls back to ::new when the pool
+ * exhausts.  The pool here is sized for the profiles under test, and the
+ * census asserts usedCount returned to baseline after every window — any
+ * leak or fallback would show up as a count/usage anomaly, not silence.
+ * ========================================================================== */
+#include <new>
+#include <cstdint>
+
+namespace zc_census {
+
+struct HeapCounter {
+    static int allocations;
+    static bool counting;
+    static int windowId;
+    static void reset(){ allocations = 0; counting = true; }
+    static void stop(){ counting = false; }
+};
+int HeapCounter::allocations = 0;
+bool HeapCounter::counting = false;
+int HeapCounter::windowId = 0;
+
+} /* namespace zc_census */
+
+void* operator new(std::size_t sz){
+    if(zc_census::HeapCounter::counting){ ++zc_census::HeapCounter::allocations; std::printf("[alloc w%d] %zu\n", zc_census::HeapCounter::windowId, (unsigned long)sz); }
+    void* p = std::malloc(sz ? sz : 1);
+    if(!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new[](std::size_t sz){
+    if(zc_census::HeapCounter::counting) ++zc_census::HeapCounter::allocations;
+    void* p = std::malloc(sz ? sz : 1);
+    if(!p) throw std::bad_alloc();
+    return p;
+}
+#if __cplusplus >= 201402L
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif
+
+namespace zc_census {
+
+/* RAII window: reset + count on construct, stop on destruct. */
+struct HeapWindow {
+    int base;
+    HeapWindow() : base(HeapCounter::allocations){ HeapCounter::counting = true; ++HeapCounter::windowId; }
+    ~HeapWindow(){ HeapCounter::counting = false; }
+    int delta() const { return HeapCounter::allocations - base; }
+};
+
+static int poolUsed(){ return ASNPool::usedCount; }
+
+} /* namespace zc_census */
+
+/* Route through THIS build's active packet path (loop() uses the same flag). */
+static inline SNMP_ERROR_RESPONSE handlePacketRoute(uint8_t* buffer, int packetLength, int* responseLength, int max_packet_size,
+                                                    ValueCallback* const* callbacks, int callbacksCount,
+                                                    const char* community, const char* readOnly){
+#if SNMP_ZERO_COPY
+    return handlePacketInPlace(buffer, packetLength, responseLength, max_packet_size, callbacks, callbacksCount, community, readOnly);
+#else
+    return handlePacket(buffer, packetLength, responseLength, max_packet_size, callbacks, callbacksCount, community, readOnly);
+#endif
+}
+
+TEST_CASE( "v3.4.2 phase0: per-packet heap-allocation census (both paths)", "[snmp][v342]" ){
+
+    /* ---- roster: one GET value + one SET target (mirrors hot-path tests) ---- */
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    int testInt2 = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    IntegerCallback* setCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.4"), &testInt2);
+    setCb->isSettable = true;
+    callbacks[callbacksCount++] = intCb;
+    callbacks[callbacksCount++] = setCb;
+
+    /* ---- build request packets OUTSIDE any counting window ---- */
+    SNMPPacket* getReq = GenerateTestSNMPRequestPacket();   /* 5 varbinds, GET */
+    uint8_t getBuf[500];
+    int getLen = getReq->serialiseInto(getBuf, 500);
+    delete getReq;   /* return pool slots: fixtures must not starve the pool */
+
+    SNMPPacket* setReq = GenerateTestSNMPRequestPacket();
+    setReq->setPDUType(SetRequestPDU);
+    uint8_t setBuf[500];
+    int setLen = setReq->serialiseInto(setBuf, 500);
+    delete setReq;
+
+    SNMPPacket* nextReq = GenerateTestSNMPRequestPacket();
+    nextReq->setPDUType(GetNextRequestPDU);
+    uint8_t nextBuf[500];
+    int nextLen = nextReq->serialiseInto(nextBuf, 500);
+    delete nextReq;
+
+    SNMPPacket* bulkReq = GenerateTestSNMPRequestPacket();
+    bulkReq->pop_back(); bulkReq->pop_back(); bulkReq->pop_back(); bulkReq->pop_back();
+    bulkReq->setVersion(SNMP_VERSION_2C);
+    bulkReq->setPDUType(GetBulkRequestPDU);
+    bulkReq->errorIndex.maxRepititions = 2;
+    bulkReq->errorStatus.nonRepeaters = 0;
+    uint8_t bulkBuf[500];
+    int bulkLen = bulkReq->serialiseInto(bulkBuf, 500);
+    delete bulkReq;
+
+    /* ---- calibration: the counter gates exactly on the window ---- */
+    {
+        zc_census::HeapWindow w;
+        int* probe = new int(7);
+        (void)probe;
+        int counted = w.delta();          /* read INSIDE the window */
+        delete probe;
+        REQUIRE( counted == 1 );          /* allocation inside window is counted */
+        REQUIRE( zc_census::HeapCounter::counting == true );
+    }
+    /* (the two REQUIREs above run inside the still-open window — they
+     * allocate, but they run AFTER `counted` was captured, so the
+     * calibration measurement itself is clean) */
+    REQUIRE( zc_census::HeapCounter::counting == false );   /* window closed: gate off */
+    {
+        int before = zc_census::HeapCounter::allocations;
+        int* probe = new int(7);
+        delete probe;
+        REQUIRE( zc_census::HeapCounter::allocations == before );   /* outside window: not counted */
+    }
+
+    int baseUsed = zc_census::poolUsed();
+
+    /* ---- GET through the ACTIVE path (this build's routing) ----
+     * Windows contain ONLY the packet call: Catch2 assertion handlers
+     * allocate (strings/message builders) and would pollute the count. */
+    int getAllocs = -1; SNMP_ERROR_RESPONSE getR = (SNMP_ERROR_RESPONSE)-1; int getLen2 = -1;
+    {
+        zc_census::HeapWindow w;
+        getLen2 = 0;
+        getR = handlePacketRoute(getBuf, getLen, &getLen2, 500,
+                                 callbacks, callbacksCount, "public", "private");
+        getAllocs = w.delta();
+    }
+    INFO( "GET heap allocations: " << getAllocs );
+    REQUIRE( getR == SNMP_GET_OCCURRED );
+    REQUIRE( getLen2 > 0 );
+    REQUIRE( zc_census::poolUsed() == baseUsed );   /* no pool drift */
+
+    /* ---- SET (decode pass + set + response) ---- */
+    int setAllocs = -1; SNMP_ERROR_RESPONSE setR = (SNMP_ERROR_RESPONSE)-1; int setLen2 = -1;
+    {
+        zc_census::HeapWindow w;
+        setLen2 = 0;
+        setR = handlePacketRoute(setBuf, setLen, &setLen2, 500,
+                                 callbacks, callbacksCount, "public", "public");
+        setAllocs = w.delta();
+    }
+    INFO( "SET heap allocations: " << setAllocs );
+    REQUIRE( setR == SNMP_SET_OCCURRED );
+    REQUIRE( setLen2 > 0 );
+    REQUIRE( testInt2 == -420000 );          /* SET integrity inside census */
+    REQUIRE( zc_census::poolUsed() == baseUsed );
+
+    /* ---- GETNEXT ---- */
+    int nextAllocs = -1; SNMP_ERROR_RESPONSE nextR = (SNMP_ERROR_RESPONSE)-1; int nextLen2 = -1;
+    {
+        zc_census::HeapWindow w;
+        nextLen2 = 0;
+        nextR = handlePacketRoute(nextBuf, nextLen, &nextLen2, 500,
+                                  callbacks, callbacksCount, "public", "private");
+        nextAllocs = w.delta();
+    }
+    INFO( "GETNEXT heap allocations: " << nextAllocs );
+    REQUIRE( nextR == SNMP_GETNEXT_OCCURRED );
+    REQUIRE( nextLen2 > 0 );
+    REQUIRE( zc_census::poolUsed() == baseUsed );
+
+    /* ---- GETBULK ---- */
+    int bulkAllocs = -1; SNMP_ERROR_RESPONSE bulkR = (SNMP_ERROR_RESPONSE)-1; int bulkLen2 = -1;
+    {
+        zc_census::HeapWindow w;
+        bulkLen2 = 0;
+        bulkR = handlePacketRoute(bulkBuf, bulkLen, &bulkLen2, 500,
+                                  callbacks, callbacksCount, "public", "private");
+        bulkAllocs = w.delta();
+    }
+    INFO( "GETBULK heap allocations: " << bulkAllocs );
+    REQUIRE( bulkR == SNMP_GETBULK_OCCURRED );
+    REQUIRE( bulkLen2 > 0 );
+    REQUIRE( zc_census::poolUsed() == baseUsed );
+
+    /* ---- print the census line (visible with -s, parsed by the harness) ---- */
+    std::printf( "[v342-census] path=%s GET=%d SET=%d GETNEXT=%d GETBULK=%d pool=%d/%d\n",
+                 SNMP_ZERO_COPY ? "zerocopy" : "classic",
+                 getAllocs, setAllocs, nextAllocs, bulkAllocs,
+                 baseUsed, (int)SNMP_POOL_ASN_OBJECTS );
+
+    delete intCb; delete setCb;
+}
+
+/* ==========================================================================
+ * v3.4.2 phase1 — AsnPtr<T> unit tests (additive; nothing migrated yet).
+ * Contract: move-only single ownership, destruction through asn_delete,
+ * release() disarms, stale-bulkFreed tolerance identical to asn_delete.
+ * ========================================================================== */
+TEST_CASE( "v3.4.2 phase1: AsnPtr move-only pool-owning pointer", "[snmp][v342]" ){
+
+    /* destructor frees the pool slot */
+    int base = ASNPool::usedCount;
+    {
+        AsnPtr<IntegerType> p(asn_new<IntegerType>(42));
+        REQUIRE( static_cast<bool>(p) );
+        REQUIRE( p->_value == 42 );
+        REQUIRE( ASNPool::usedCount == base + 1 );
+    }
+    REQUIRE( ASNPool::usedCount == base );   /* freed on scope exit */
+
+    /* move transfers ownership; source disarmed */
+    {
+        AsnPtr<IntegerType> a(asn_new<IntegerType>(7));
+        IntegerType* raw = a.get();
+        AsnPtr<IntegerType> b(std::move(a));
+        REQUIRE( b.get() == raw );
+        REQUIRE( !a );                       /* source disarmed */
+        REQUIRE( ASNPool::usedCount == base + 1 );   /* not double-freed */
+    }
+    REQUIRE( ASNPool::usedCount == base );
+
+    /* move-assignment frees the target's previous object exactly once */
+    {
+        AsnPtr<IntegerType> a(asn_new<IntegerType>(1));
+        AsnPtr<IntegerType> b(asn_new<IntegerType>(2));
+        REQUIRE( ASNPool::usedCount == base + 2 );
+        b = std::move(a);                    /* b's old object freed here */
+        REQUIRE( ASNPool::usedCount == base + 1 );
+        REQUIRE( b->_value == 1 );
+    }
+    REQUIRE( ASNPool::usedCount == base );
+
+    /* release() disarms and hands raw ownership to a raw-owning API */
+    {
+        IntegerType* raw = nullptr;
+        {
+            AsnPtr<IntegerType> a(asn_new<IntegerType>(99));
+            raw = a.release();
+            REQUIRE( !a );                   /* guard disarmed */
+        }                                    /* destructor must NOT free */
+        REQUIRE( ASNPool::usedCount == base + 1 );
+        REQUIRE( raw->_value == 99 );
+        asn_delete(raw);                     /* caller destroys explicitly */
+        REQUIRE( ASNPool::usedCount == base );
+    }
+
+    /* reset() with self-value must not destroy */
+    {
+        AsnPtr<IntegerType> a(asn_new<IntegerType>(5));
+        IntegerType* raw = a.get();
+        a.reset(raw);
+        REQUIRE( ASNPool::usedCount == base + 1 );
+        REQUIRE( a->_value == 5 );
+    }
+    REQUIRE( ASNPool::usedCount == base );
+
+    /* default-constructed: empty, safe destroy */
+    {
+        AsnPtr<IntegerType> e;
+        REQUIRE( !e );
+        e.reset();                            /* no-op */
+        REQUIRE( ASNPool::usedCount == base );
+    }
+
+    /* swap */
+    {
+        AsnPtr<IntegerType> a(asn_new<IntegerType>(10));
+        AsnPtr<IntegerType> b(asn_new<IntegerType>(20));
+        a.swap(b);
+        REQUIRE( a->_value == 20 );
+        REQUIRE( b->_value == 10 );
+    }
+    REQUIRE( ASNPool::usedCount == base );
+
+    /* stale bulkFreed slot: silent, matches the asn_delete contract
+     * (v3.3.3 semantics carried over).  LAST block: resetAll() re-baselines
+     * usedCount to permCount, so no usedCount invariant may follow it. */
+    int alarmsBefore = ASNPool::doubleReleaseAlarms;
+    {
+        AsnPtr<IntegerType> a(asn_new<IntegerType>(3));
+        ASNPool::resetAll();                  /* bulk-free under the guard */
+        /* guard destructor now deletes a bulkFreed slot: sanctioned stale
+         * delete — must be silent (no new alarm) */
+    }
+    REQUIRE( ASNPool::doubleReleaseAlarms == alarmsBefore );
+}

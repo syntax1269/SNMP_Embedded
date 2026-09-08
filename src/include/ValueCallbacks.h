@@ -5,15 +5,14 @@
 #include "BERView.h"
 #include <algorithm>
 
+/* v3.4.2: the zero-heap factory alias.  Every library callback builds its
+ * response value through asn_new<T>() into the pool; AsnPtr (move-only,
+ * destructor -> asn_delete) carries it to the response plan with zero heap
+ * traffic.  Replaces the former vcb_pool_shared() shared_ptr helper whose
+ * control block was a per-value heap allocation (Report_001 finding #1). */
 template <typename T>
-static inline void vcb_pool_asn_deleter(T* p) noexcept {
-    asn_delete(static_cast<BER_CONTAINER*>(p));
-}
-
-template <typename T>
-static inline std::shared_ptr<T> vcb_pool_shared(T* p) noexcept {
-    if(!p) return nullptr;
-    return std::shared_ptr<T>(p, vcb_pool_asn_deleter<T>);
+static inline AsnPtr<BER_CONTAINER> vcb_pool_ptr(T* p) noexcept {
+    return AsnPtr<BER_CONTAINER>(p);
 }
 
 typedef int (*GETINT_FUNC)() ;
@@ -53,11 +52,30 @@ class ValueCallback {
                                                const uint8_t* oidData, int oidLen, bool walk,
                                                int startAt = 0, int *foundAt = nullptr);
 #endif /* SNMP_ZERO_COPY */
-    static std::shared_ptr<BER_CONTAINER> getValueForCallback(ValueCallback* callback);
-    static SNMP_ERROR_STATUS setValueForCallback(ValueCallback* callback, const std::shared_ptr<BER_CONTAINER> &value);
+    /* v3.4.2 — zero-heap value path.  getValueForCallback() now returns a
+     * move-only AsnPtr (pool-owned, destructor -> asn_delete, no heap
+     * bookkeeping).  setValueForCallback() takes a BORROWED const view:
+     * the value is only read during the call, never retained. */
+    static AsnPtr<BER_CONTAINER> getValueForCallback(ValueCallback* callback);
+    static SNMP_ERROR_STATUS setValueForCallback(ValueCallback* callback, const BER_CONTAINER* value);
 
 protected:
-    virtual std::shared_ptr<BER_CONTAINER> buildTypeWithValue() = 0;
+    /* v3.4.2 — the factory every library callback overrides.  Returns a
+     * pool-owning AsnPtr; empty on pool exhaustion or an invalid source
+     * value (mirrors the old nullptr return). */
+    virtual AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() = 0;
+
+    /* DEPRECATED legacy factory (shared_ptr era).  Nothing in this library
+     * or its examples overrides it any more; kept ONLY so external sketches
+     * written against the pre-3.4.2 header still compile and run.  An
+     * external override pays one shared_ptr control block per GET — the
+     * exact cost this release removes from the library's own path.
+     * Default: empty (an external subclass that overrides NEITHER factory
+     * serves no value; pre-3.4.2 the pure virtual forced an override, so
+     * this default is unreachable for any real legacy subclass).
+     * Removal: next major. */
+    virtual std::shared_ptr<BER_CONTAINER> buildTypeWithValue() { return nullptr; }
+
     virtual SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) = 0;
 };
 
@@ -73,7 +91,7 @@ class IntegerCallback: public ValueCallback {
     int* const value;
     int modifier = 0;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -84,8 +102,8 @@ class StaticIntegerCallback: public ValueCallback {
   protected:
     const int val;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override {
-        return vcb_pool_shared(asn_new<IntegerType>(val));
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override {
+        return vcb_pool_ptr(asn_new<IntegerType>(val));
     }
 
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER*) override {
@@ -102,8 +120,8 @@ public:
 protected:
     GETINT_FUNC m_callback;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override {
-        return vcb_pool_shared(asn_new<IntegerType>(m_callback()));
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override {
+        return vcb_pool_ptr(asn_new<IntegerType>(m_callback()));
     }
 
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER*) override {
@@ -118,7 +136,7 @@ class TimestampCallback: public ValueCallback {
   protected:
     uint32_t* const value;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -131,8 +149,8 @@ public:
 protected:
     GETUINT_FUNC m_callback;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override {
-        return vcb_pool_shared(asn_new<TimestampType>(m_callback()));
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override {
+        return vcb_pool_ptr(asn_new<TimestampType>(m_callback()));
     }
 
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER*) override {
@@ -152,7 +170,7 @@ public:
 protected:
     char value[SNMP_MAX_STRING_LEN + 1];
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER*) override {
         return NO_ACCESS;
     }
@@ -166,8 +184,8 @@ public:
 protected:
     GETSTRING_FUNC m_callback;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override {
-      return vcb_pool_shared(asn_new<OctetType>(m_callback()));
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override {
+      return vcb_pool_ptr(asn_new<OctetType>(m_callback()));
     }
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER*) override {
         return NO_ACCESS;
@@ -182,7 +200,7 @@ class StringCallback: public ValueCallback {
     char** const value;
     size_t const max_len;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -199,7 +217,7 @@ class StringBufCallback: public ValueCallback {
     char* const  value;
     size_t const max_len;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -211,7 +229,7 @@ class OpaqueCallback: public ValueCallback {
     uint8_t* const value;
     int const data_len;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -227,7 +245,7 @@ class OIDCallback: public ValueCallback {
   protected:
     char value[SNMP_MAX_OID_STR_LEN + 1];
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue (BER_CONTAINER*) override{
         return NO_ACCESS;
     }
@@ -240,7 +258,7 @@ class Counter32Callback: public ValueCallback {
   protected:
     uint32_t* const value;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -252,7 +270,7 @@ class Gauge32Callback: public ValueCallback {
   protected:
     uint32_t* const value;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 
@@ -264,8 +282,8 @@ class DynamicGauge32Callback: public ValueCallback {
   protected:
     GETUINT_FUNC m_callback;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override {
-        return vcb_pool_shared(asn_new<Gauge>(m_callback()));
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override {
+        return vcb_pool_ptr(asn_new<Gauge>(m_callback()));
     }
     SNMP_ERROR_STATUS setTypeWithValue (BER_CONTAINER*) override{
         return NO_ACCESS;
@@ -279,7 +297,7 @@ class Counter64Callback: public ValueCallback {
   protected:
     uint64_t* const value;
 
-    std::shared_ptr<BER_CONTAINER> buildTypeWithValue() override;
+    AsnPtr<BER_CONTAINER> buildTypeWithValueRaw() override;
     SNMP_ERROR_STATUS setTypeWithValue(BER_CONTAINER* value) override;
 };
 

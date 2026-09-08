@@ -4,15 +4,10 @@
 
 #include <algorithm>
 
+/* v3.4.2: zero-heap factory alias — see ValueCallbacks.h. */
 template <typename T>
-static void pool_asn_deleter(T* p) noexcept {
-    asn_delete(static_cast<BER_CONTAINER*>(p));
-}
-
-template <typename T>
-static inline std::shared_ptr<T> pool_shared(T* p) noexcept {
-    if(!p) return nullptr;
-    return std::shared_ptr<T>(p, pool_asn_deleter<T>);
+static inline AsnPtr<BER_CONTAINER> pool_shared(T* p) noexcept {
+    return AsnPtr<BER_CONTAINER>(p);
 }
 
 #define ASSERT_VALID_VALUE(value) if(!value) return nullptr;
@@ -135,13 +130,24 @@ ValueCallback* ValueCallback::findCallbackForSlice(ValueCallback* const *callbac
 }
 #endif /* SNMP_ZERO_COPY */
 
-std::shared_ptr<BER_CONTAINER> ValueCallback::getValueForCallback(ValueCallback* callback){
+AsnPtr<BER_CONTAINER> ValueCallback::getValueForCallback(ValueCallback* callback){
     SNMP_LOGD("Getting value for callback of OID: %s, type: %d\n", callback->OID->string(), callback->type);
-    auto value = callback->buildTypeWithValue();
+    /* v3.4.2: the optimized path — library callbacks build straight into a
+     * pool-owning AsnPtr.  A legacy external subclass that still overrides
+     * the deprecated buildTypeWithValue() cannot be disarmed (shared_ptr may
+     * be shared), so its value is CLONED out into a fresh pool object; the
+     * legacy temporary releases normally at scope exit.  That clone is the
+     * one remaining cost legacy subclasses pay — and the reason to migrate
+     * to buildTypeWithValueRaw(). */
+    AsnPtr<BER_CONTAINER> value = callback->buildTypeWithValueRaw();
+    if(!value){
+        std::shared_ptr<BER_CONTAINER> legacy = callback->buildTypeWithValue();
+        if(legacy) value = AsnPtr<BER_CONTAINER>(asn_clone(legacy.get()));
+    }
     return value;
 }
 
-SNMP_ERROR_STATUS ValueCallback::setValueForCallback(ValueCallback* callback, const std::shared_ptr<BER_CONTAINER> &value){
+SNMP_ERROR_STATUS ValueCallback::setValueForCallback(ValueCallback* callback, const BER_CONTAINER* value){
     SNMP_LOGD("Setting value for callback of OID: %s\n", callback->OID->string());
 
     if(!callback->isSettable){
@@ -149,7 +155,7 @@ SNMP_ERROR_STATUS ValueCallback::setValueForCallback(ValueCallback* callback, co
     }
 
     callback->setOccurred = true;
-    SNMP_ERROR_STATUS valid = callback->setTypeWithValue(value.get());
+    SNMP_ERROR_STATUS valid = callback->setTypeWithValue(const_cast<BER_CONTAINER*>(value));
     if(valid != NO_ERROR){
         callback->setOccurred = false;
     }
@@ -157,13 +163,13 @@ SNMP_ERROR_STATUS ValueCallback::setValueForCallback(ValueCallback* callback, co
     return valid;
 }
 
-std::shared_ptr<BER_CONTAINER> IntegerCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> IntegerCallback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
-    auto val = pool_shared(asn_new<IntegerType>(*this->value));
+    AsnPtr<BER_CONTAINER> val(asn_new<IntegerType>(*this->value));
     if(!val) return nullptr;
     if(this->modifier != 0){
-        val->_value /= this->modifier;
+        static_cast<IntegerType*>(val.get())->_value /= this->modifier;
     }
     return val;
 }
@@ -182,7 +188,7 @@ SNMP_ERROR_STATUS IntegerCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> TimestampCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> TimestampCallback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<TimestampType>(*this->value));
@@ -198,7 +204,7 @@ SNMP_ERROR_STATUS TimestampCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> StringCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> StringCallback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<OctetType>(*this->value));
@@ -215,7 +221,7 @@ SNMP_ERROR_STATUS StringCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> StringBufCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> StringBufCallback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<OctetType>(this->value));
@@ -232,12 +238,12 @@ SNMP_ERROR_STATUS StringBufCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> ReadOnlyStringCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> ReadOnlyStringCallback::buildTypeWithValueRaw(){
     return pool_shared(asn_new<OctetType>(this->value));
 }
 
 
-std::shared_ptr<BER_CONTAINER> OpaqueCallback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> OpaqueCallback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<OpaqueType>(this->value, this->data_len));
@@ -255,13 +261,13 @@ SNMP_ERROR_STATUS OpaqueCallback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> OIDCallback::buildTypeWithValue(){
-    auto oid = pool_shared(asn_new<OIDType>(this->value));
-    if(!oid || !oid->valid) return nullptr;
+AsnPtr<BER_CONTAINER> OIDCallback::buildTypeWithValueRaw(){
+    AsnPtr<BER_CONTAINER> oid(asn_new<OIDType>(this->value));
+    if(!oid || !static_cast<const OIDType*>(oid.get())->valid) return nullptr;
     return oid;
 }
 
-std::shared_ptr<BER_CONTAINER> Counter32Callback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> Counter32Callback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<Counter32>(*this->value));
@@ -281,7 +287,7 @@ SNMP_ERROR_STATUS Counter32Callback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> Gauge32Callback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> Gauge32Callback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<Gauge>(*this->value));
@@ -297,7 +303,7 @@ SNMP_ERROR_STATUS Gauge32Callback::setTypeWithValue(BER_CONTAINER* rawValue){
     return NO_ERROR;
 }
 
-std::shared_ptr<BER_CONTAINER> Counter64Callback::buildTypeWithValue(){
+AsnPtr<BER_CONTAINER> Counter64Callback::buildTypeWithValueRaw(){
     ASSERT_VALID_VALUE(this->value);
 
     return pool_shared(asn_new<Counter64>(*this->value));

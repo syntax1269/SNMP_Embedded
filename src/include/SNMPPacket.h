@@ -42,17 +42,20 @@ class SNMPPacket {
         this->setVersion(packet.snmpVersion);
         this->setCommunityString(packet.communityString);
 
-        // Provide reusable ASN containers if required
+        /* Provide reusable ASN containers if required.
+         * v3.4.2: AsnPtr is move-only, so the copy clones through the pool
+         * (no heap).  These members only exist on parsed packets; response
+         * packets built from scalars never populate them. */
         if(packet.requestIDPtr){
-            this->requestIDPtr = packet.requestIDPtr;
+            this->requestIDPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(packet.requestIDPtr->_value));
         }
 
         if(packet.snmpVersionPtr){
-            this->snmpVersionPtr = packet.snmpVersionPtr;
+            this->snmpVersionPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(packet.snmpVersionPtr->_value));
         }
 
         if(packet.communityStringPtr){
-            this->communityStringPtr = packet.communityStringPtr;
+            this->communityStringPtr = AsnPtr<OctetType>(asn_new<OctetType>(packet.communityStringPtr->_value, packet.communityStringPtr->_valueLen));
         }
 
         /* NOTE: varbindCount / varbindList[] are intentionally NOT copied.
@@ -77,9 +80,11 @@ class SNMPPacket {
 
     bool reuse = false;
 
-    std::shared_ptr<IntegerType> requestIDPtr = nullptr;
-    std::shared_ptr<IntegerType> snmpVersionPtr = nullptr;
-    std::shared_ptr<OctetType> communityStringPtr = nullptr;
+    /* v3.4.2: pool-owning AsnPtr — parsed-header containers with zero heap
+     * bookkeeping (Report_001 finding #1). */
+    AsnPtr<IntegerType> requestIDPtr;
+    AsnPtr<IntegerType> snmpVersionPtr;
+    AsnPtr<OctetType>   communityStringPtr;
 
     snmp_request_id_t requestID = 0;
     SNMP_VERSION snmpVersion = (SNMP_VERSION)0;
@@ -156,9 +161,9 @@ class SNMPPacket {
     virtual void releasePoolState(){        this->clear();                       /* frees varbindList oid/value  */
         asn_delete(this->packet);            /* frees the whole packet tree  */
         this->packet = nullptr;
-        this->requestIDPtr      = nullptr;   /* parsed-header containers     */
-        this->snmpVersionPtr    = nullptr;
-        this->communityStringPtr = nullptr;
+        this->requestIDPtr.reset();          /* parsed-header containers     */
+        this->snmpVersionPtr.reset();
+        this->communityStringPtr.reset();
     }
 
     union ErrorStatus errorStatus = { NO_ERROR };
@@ -172,8 +177,6 @@ class SNMPPacket {
     typedef bool (*BuildPDUHeaderFn)(ComplexType* snmpPDU, void* userdata);
 
     bool _build_pdu_envelope(BuildPDUHeaderFn fill_pdu, void* userdata);
-
-    virtual std::shared_ptr<ComplexType> generateVarBindList();
 
     /* Build the varbind tree with uniform recursive ownership (raw new'd;
      * every ComplexType node has _ownsChildren=true).  Used by build()

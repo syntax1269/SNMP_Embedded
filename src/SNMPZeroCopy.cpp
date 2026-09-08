@@ -41,19 +41,11 @@ static bool putOidWire(BerWriter& writer, const OidWire& oid){
     return writer.putBytes(oid.bytes, oid.len);
 }
 
-/* ValueCallback::getValueForCallback() already returns a pool-aware
- * shared_ptr.  Values decoded from the request need the same pool deleter. */
-struct PoolDeleter {
-    void operator()(BER_CONTAINER* value) const noexcept {
-        asn_delete(value);
-    }
-};
-
-static std::shared_ptr<BER_CONTAINER> poolShared(BER_CONTAINER* value){
-    if(!value){
-        return nullptr;
-    }
-    return std::shared_ptr<BER_CONTAINER>(value, PoolDeleter());
+/* v3.4.2: pool-owning AsnPtr — no control block, destruction through
+ * asn_delete (identical lifetime contract to the former PoolDeleter
+ * shared_ptr, minus the per-value heap allocation). */
+static AsnPtr<BER_CONTAINER> poolShared(BER_CONTAINER* value){
+    return AsnPtr<BER_CONTAINER>(value);
 }
 
 /* This is the same factory used by ComplexType::fromBuffer().  Keeping the
@@ -92,7 +84,7 @@ static BER_CONTAINER* makeValueForTag(ASN_TYPE type){
  * behavior and prevents SET side effects before a later malformed value is
  * discovered. */
 static bool decodeRequestValues(const SnmpHeaderView& request,
-                                std::shared_ptr<BER_CONTAINER>* decoded,
+                                AsnPtr<BER_CONTAINER>* decoded,
                                 const uint8_t* packet,
                                 size_t packetLength){
     const uint8_t* packetEnd = packet + packetLength;
@@ -111,12 +103,12 @@ static bool decodeRequestValues(const SnmpHeaderView& request,
             return false;
         }
 
-        std::shared_ptr<BER_CONTAINER> value = poolShared(raw);
+        AsnPtr<BER_CONTAINER> value = poolShared(raw);
         int used = value->fromBuffer(vb.valueTlv, vb.valueTlvLen);
         if(used <= 0 || used != (int)vb.valueTlvLen){
             return false;
         }
-        decoded[i] = value;
+        decoded[i] = std::move(value);
     }
     return true;
 }
@@ -125,7 +117,7 @@ static bool decodeRequestValues(const SnmpHeaderView& request,
  * are copied out of the UDP buffer before Phase B starts. */
 struct PlannedVarBind {
     OidWire oid;
-    std::shared_ptr<BER_CONTAINER> value;
+    AsnPtr<BER_CONTAINER> value;   /* v3.4.2: pool-owning, move-only */
     uint8_t nullTag;
     SNMP_ERROR_STATUS error;
     int responseIndex;
@@ -141,14 +133,14 @@ struct ResponsePlan {
 
     ResponsePlan(): varbinds(), count(0), lastError(NO_ERROR), lastErrorIndex(0) {}
 
-    bool add(const OidWire& oid, const std::shared_ptr<BER_CONTAINER>& value,
+    bool add(const OidWire& oid, AsnPtr<BER_CONTAINER> value,
              uint8_t nullTag, SNMP_ERROR_STATUS error){
         if(count >= SNMP_MAX_VARBINDS){
             return false;
         }
         PlannedVarBind& item = varbinds[count];
         item.oid = oid;
-        item.value = value;
+        item.value = std::move(value);   /* move-own; source disarmed */
         item.nullTag = nullTag;
         item.error = error;
         item.responseIndex = ++count;
@@ -161,23 +153,23 @@ struct ResponsePlan {
 };
 
 static bool addRequestOidPlan(ResponsePlan& plan, const VarBindView& vb,
-                              const std::shared_ptr<BER_CONTAINER>& value,
+                              AsnPtr<BER_CONTAINER> value,
                               uint8_t nullTag, SNMP_ERROR_STATUS error){
     OidWire oid;
     if(!makeOidWire(vb.oid, vb.oidLen, &oid)){
         return false;
     }
-    return plan.add(oid, value, nullTag, error);
+    return plan.add(oid, std::move(value), nullTag, error);
 }
 
 static bool addCallbackOidPlan(ResponsePlan& plan, ValueCallback* callback,
-                               const std::shared_ptr<BER_CONTAINER>& value,
+                               AsnPtr<BER_CONTAINER> value,
                                uint8_t nullTag, SNMP_ERROR_STATUS error){
     OidWire oid;
     if(!makeCallbackOidWire(callback, &oid)){
         return false;
     }
-    return plan.add(oid, value, nullTag, error);
+    return plan.add(oid, std::move(value), nullTag, error);
 }
 
 static bool stageGet(ResponsePlan& plan,
@@ -196,7 +188,7 @@ static bool stageGet(ResponsePlan& plan,
             continue;
         }
 
-        std::shared_ptr<BER_CONTAINER> value =
+        AsnPtr<BER_CONTAINER> value =
             ValueCallback::getValueForCallback(callback);
         if(!value){
             SNMP_ERROR_STATUS error =
@@ -207,7 +199,7 @@ static bool stageGet(ResponsePlan& plan,
             continue;
         }
 
-        if(!addCallbackOidPlan(plan, callback, value, 0, NO_ERROR)){
+        if(!addCallbackOidPlan(plan, callback, std::move(value), 0, NO_ERROR)){
             return false;
         }
     }
@@ -239,7 +231,7 @@ static bool stageGetBulk(ResponsePlan& plan,
             continue;
         }
 
-        std::shared_ptr<BER_CONTAINER> value =
+        AsnPtr<BER_CONTAINER> value =
             ValueCallback::getValueForCallback(callback);
         if(!value){
             if(!addCallbackOidPlan(plan, callback, nullptr, NULLTYPE, GEN_ERR)){
@@ -248,7 +240,7 @@ static bool stageGetBulk(ResponsePlan& plan,
             continue;
         }
 
-        if(!addRequestOidPlan(plan, vb, value, 0, NO_ERROR)){
+        if(!addRequestOidPlan(plan, vb, std::move(value), 0, NO_ERROR)){
             return false;
         }
     }
@@ -279,7 +271,7 @@ static bool stageGetBulk(ResponsePlan& plan,
             if(!makeCallbackOidWire(callback, &callbackOid)){
                 return false;
             }
-            std::shared_ptr<BER_CONTAINER> value =
+            AsnPtr<BER_CONTAINER> value =
                 ValueCallback::getValueForCallback(callback);
             if(!value){
                 if(!plan.add(callbackOid, nullptr, NULLTYPE, GEN_ERR)){
@@ -288,7 +280,7 @@ static bool stageGetBulk(ResponsePlan& plan,
                 break;
             }
 
-            if(!plan.add(callbackOid, value, 0, NO_ERROR)){
+            if(!plan.add(callbackOid, std::move(value), 0, NO_ERROR)){
                 return false;
             }
             cursor = callbackOid;
@@ -300,7 +292,7 @@ static bool stageGetBulk(ResponsePlan& plan,
 static bool stageSet(ResponsePlan& plan,
                      ValueCallback* const* callbacks, int callbacksCount,
                      const SnmpHeaderView& request,
-                     const std::shared_ptr<BER_CONTAINER>* decoded){
+                     const AsnPtr<BER_CONTAINER>* decoded){
     for(int i = 0; i < request.varbindCount; i++){
         const VarBindView& vb = request.vbs[i];
         ValueCallback* callback = ValueCallback::findCallbackForSlice(
@@ -337,7 +329,7 @@ static bool stageSet(ResponsePlan& plan,
             return false;
         }
         SNMP_ERROR_STATUS setError =
-            ValueCallback::setValueForCallback(callback, decoded[i]);
+            ValueCallback::setValueForCallback(callback, decoded[i].get());
         if(setError != NO_ERROR){
             SNMP_ERROR_STATUS error = SNMP_ERROR_VERSION_CTRL(
                 setError, (SNMP_VERSION)request.version);
@@ -347,7 +339,7 @@ static bool stageSet(ResponsePlan& plan,
             continue;
         }
 
-        std::shared_ptr<BER_CONTAINER> fresh =
+        AsnPtr<BER_CONTAINER> fresh =
             ValueCallback::getValueForCallback(callback);
         if(!fresh){
             SNMP_ERROR_STATUS error = SNMP_ERROR_VERSION_CTRL(
@@ -358,14 +350,14 @@ static bool stageSet(ResponsePlan& plan,
             continue;
         }
 
-        if(!addCallbackOidPlan(plan, callback, fresh, 0, NO_ERROR)){
+        if(!addCallbackOidPlan(plan, callback, std::move(fresh), 0, NO_ERROR)){
             return false;
         }
     }
     return true;
 }
 
-static bool writeValue(BerWriter& writer, const std::shared_ptr<BER_CONTAINER>& value){
+static bool writeValue(BerWriter& writer, const AsnPtr<BER_CONTAINER>& value){
     if(!value){
         return false;
     }
@@ -483,7 +475,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
     }
 
     /* Decode all request values before any callback or response write. */
-    std::shared_ptr<BER_CONTAINER> decoded[SNMP_MAX_VARBINDS];
+    AsnPtr<BER_CONTAINER> decoded[SNMP_MAX_VARBINDS];
     if(!decodeRequestValues(request, decoded, buffer, (size_t)packetLength)){
         return SNMP_REQUEST_INVALID;
     }

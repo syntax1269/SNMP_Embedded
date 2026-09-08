@@ -17,16 +17,13 @@
  * FIX: wrap every `asn_new<T>()` passed into a `shared_ptr<T>` context
  * with `pool_asn_sp(...)` below.  It constructs a shared_ptr whose
  * custom deleter calls `asn_delete` instead of `operator delete`. */
-namespace {
-    struct pool_asn_deleter {
-        void operator()(BER_CONTAINER* p) const noexcept { asn_delete(p); }
-    };
-}
+/* v3.4.2: pool-owning AsnPtr replaces the shared_ptr wrapper — no control
+ * block, destruction still through asn_delete. */
 template <typename T>
-static inline std::shared_ptr<BER_CONTAINER> pool_asn_sp(T* raw_pool_ptr) noexcept {
+static inline AsnPtr<BER_CONTAINER> pool_asn_sp(T* raw_pool_ptr) noexcept {
     static_assert(std::is_base_of<BER_CONTAINER, T>::value,
                   "pool_asn_sp only accepts BER_CONTAINER-derived pointers");
-    return std::shared_ptr<BER_CONTAINER>(static_cast<BER_CONTAINER*>(raw_pool_ptr), pool_asn_deleter());
+    return AsnPtr<BER_CONTAINER>(static_cast<BER_CONTAINER*>(raw_pool_ptr));
 }
 
 template<typename... Args>
@@ -65,7 +62,7 @@ bool handleGetRequestPDU(ValueCallback* const *callbacks, int callbacksCount, co
         }
 
         SNMP_LOGD("Callback found with OID: %s\n", callback->OID->string());
-        auto value = ValueCallback::getValueForCallback(callback);
+        AsnPtr<BER_CONTAINER> value = ValueCallback::getValueForCallback(callback);
 
         if(!value){
             SNMP_LOGD("Couldn't get value for callback\n");
@@ -73,7 +70,7 @@ bool handleGetRequestPDU(ValueCallback* const *callbacks, int callbacksCount, co
             continue;
         }
 
-        if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, value)) continue;
+        if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, std::move(value))) continue;
     }
     return true;
 }
@@ -103,15 +100,16 @@ bool handleSetRequestPDU(ValueCallback* const *callbacks, int callbacksCount, co
             if(!appendResponseVarBind(outResponseList, outResponseCount, requestVarBind.oid->cloneRaw(), SNMP_ERROR_VERSION_CTRL(READ_ONLY, snmpVersion))) continue;
             continue;
         }
-        std::shared_ptr<BER_CONTAINER> valueView(requestVarBind.value, [](BER_CONTAINER*){});
-        SNMP_ERROR_STATUS setError = ValueCallback::setValueForCallback(callback, valueView);
+        /* v3.4.2: borrowed const view — setValueForCallback reads the value
+         * during the call and never retains it. */
+        SNMP_ERROR_STATUS setError = ValueCallback::setValueForCallback(callback, requestVarBind.value);
         if(setError != NO_ERROR){
             SNMP_LOGD("Attempting to set Variable failed: %d\n", setError);
             if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, SNMP_ERROR_VERSION_CTRL(setError, snmpVersion))) continue;
             continue;
         }
 
-        auto value = ValueCallback::getValueForCallback(callback);
+        AsnPtr<BER_CONTAINER> value = ValueCallback::getValueForCallback(callback);
 
         if(!value){
             SNMP_LOGD("Couldn't get value for callback\n");
@@ -119,7 +117,7 @@ bool handleSetRequestPDU(ValueCallback* const *callbacks, int callbacksCount, co
             continue;
         }
 
-        if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, value)) continue;
+        if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, std::move(value))) continue;
     }
     return true;
 
@@ -142,7 +140,7 @@ bool handleGetBulkRequestPDU(ValueCallback* const *callbacks, int callbacksCount
                 continue;
             }
 
-            auto value = ValueCallback::getValueForCallback(callback);
+            AsnPtr<BER_CONTAINER> value = ValueCallback::getValueForCallback(callback);
             if(!value){
                 SNMP_LOGD("Couldn't get value for callback\n");
                 if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, GEN_ERR)){
@@ -151,7 +149,7 @@ bool handleGetBulkRequestPDU(ValueCallback* const *callbacks, int callbacksCount
                 }
                 continue;
             }
-            if(!appendResponseVarBind(outResponseList, outResponseCount, requestVarBind, value)){
+            if(!appendResponseVarBind(outResponseList, outResponseCount, requestVarBind, std::move(value))){
                 *outOverflow = true;
                 return false;
             }
@@ -180,7 +178,7 @@ bool handleGetBulkRequestPDU(ValueCallback* const *callbacks, int callbacksCount
                     break;
                 }
 
-                auto value = ValueCallback::getValueForCallback(callback);
+                AsnPtr<BER_CONTAINER> value = ValueCallback::getValueForCallback(callback);
 
                 if(!value){
                     SNMP_LOGD("Couldn't get value for callback\n");
@@ -192,7 +190,7 @@ bool handleGetBulkRequestPDU(ValueCallback* const *callbacks, int callbacksCount
                     break;
                 }
 
-                if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, value)){
+                if(!appendResponseVarBind(outResponseList, outResponseCount, callback->OID, std::move(value))){
                     asn_delete(oid);
                     *outOverflow = true;
                     return false;

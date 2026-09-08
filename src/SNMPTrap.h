@@ -193,7 +193,6 @@ class SNMPTrap : public SNMPPacket {
     int callbacksCount = 0;
     bool _trapOIDOwned = false;
 
-    std::shared_ptr<ComplexType> generateVarBindList() override;
     ComplexType* generateVarBindListRaw() override;
 
     static OIDType s_timestampOID;

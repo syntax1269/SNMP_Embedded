@@ -51,11 +51,20 @@ class VarBind {
         value(asn_new<NullType>()),
         errorStatus(error) {}
 
-    /* Convenience ctors taking base OIDType* raw + shared_ptr value or
-     * SNMP_ERROR_STATUS.  These are used in PDU handlers where we have a
-     * walk-local OIDType* owned raw pointer, plus a shared_ptr value or
-     * numeric error status.  VarBind takes ownership of the oid_ raw
-     * pointer, and deep-clones any shared_ptr value content. */
+    /* v3.4.2: MOVE-OWNERSHIP ctor — takes the value's pool object directly
+     * (AsnPtr::release), no clone.  This is the hot-path ctor: GET/SET/
+     * GETBULK response values flow through here with zero heap traffic.
+     * (The former shared_ptr overload deep-cloned the value AND cost a
+     * control block; both costs are gone.) */
+    VarBind(OIDType* oid_, AsnPtr<BER_CONTAINER> valueSP):
+        oid(oid_),
+        type(valueSP ? valueSP->_type : NULLTYPE),
+        value(valueSP ? valueSP.release() : asn_new<NullType>()),
+        errorStatus(NO_ERROR) {}
+
+    /* Legacy convenience ctor kept for API compatibility: deep-clones any
+     * shared_ptr value content into owned raw storage (shared_ptr is never
+     * stored).  Used by sketches/tests still handing shared_ptr values. */
     VarBind(OIDType* oid_, const std::shared_ptr<BER_CONTAINER>& valueSP):
         oid(oid_),
         type(valueSP ? valueSP->_type : NULLTYPE),
@@ -104,6 +113,13 @@ class VarBind {
         value(cloneValueOrNull(valueSP.get(), valueSP ? valueSP->_type : NULLTYPE)),
         errorStatus(NO_ERROR) {}
 
+    /* v3.4.2: move-ownership twin (classic-path GET results). */
+    VarBind(const SortableOIDType* oidSrc, AsnPtr<BER_CONTAINER> valueSP):
+        oid(oidSrc->cloneRaw()),
+        type(valueSP ? valueSP->_type : NULLTYPE),
+        value(valueSP ? valueSP.release() : asn_new<NullType>()),
+        errorStatus(NO_ERROR) {}
+
     /* "Replace value" ctors: copies OID and type from existing VarBind,
      * installs a new owned value.  Used in PDU handlers for endOfMibView
      * / noSuchObject / normal get-result responses.  Both raw and
@@ -120,6 +136,13 @@ class VarBind {
         value(cloneValueOrNull(valueSP.get(), valueSP ? valueSP->_type : NULLTYPE)),
         errorStatus(vb.errorStatus) {}
 
+    /* v3.4.2: move-ownership "replace value" twin. */
+    VarBind(const VarBind& vb, AsnPtr<BER_CONTAINER> valueSP):
+        oid(cloneOidOrNull(vb.oid)),
+        type(valueSP ? valueSP->_type : vb.type),
+        value(valueSP ? valueSP.release() : asn_new<NullType>()),
+        errorStatus(vb.errorStatus) {}
+
     /* Destructor: frees owned oid + value. */
     ~VarBind(){ destroy(); }
 
@@ -129,16 +152,8 @@ class VarBind {
     BER_CONTAINER* value;
     SNMP_ERROR_STATUS errorStatus = NO_ERROR;
 
-  private:
-    void destroy(){
-        asn_delete(this->oid);   this->oid   = nullptr;
-        asn_delete(this->value); this->value = nullptr;
-    }
-
-    static OIDType* cloneOidOrNull(const OIDType* src){
-        return src ? src->cloneRaw() : nullptr;
-    }
-
+    /* v3.4.2: public — SNMPPacket::parsePacket uses it to deep-clone parsed
+     * varbind values into owned raw storage (replaces the shared_ptr view). */
     static BER_CONTAINER* cloneValueOrNull(const BER_CONTAINER* src, ASN_TYPE fallbackType){
         if(!src){
             switch(fallbackType){
@@ -177,6 +192,16 @@ class VarBind {
             }
             default:             return asn_new<NullType>();
         }
+    }
+
+  private:
+    void destroy(){
+        asn_delete(this->oid);   this->oid   = nullptr;
+        asn_delete(this->value); this->value = nullptr;
+    }
+
+    static OIDType* cloneOidOrNull(const OIDType* src){
+        return src ? src->cloneRaw() : nullptr;
     }
 };
 

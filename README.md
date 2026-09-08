@@ -35,7 +35,7 @@
   * InformRequest
 * Deterministic memory
   * Compile-time derived pool sizing — the arena scales with the handlers you register
-  * Boot-time lock-in — one contiguous arena claimed before `setup()`/WiFi; zero per-packet heap traffic
+  * Boot-time lock-in — one contiguous arena claimed before `setup()`/WiFi; zero per-packet heap traffic (proven: measured 0 heap allocations per packet on every request path since v3.4.2)
   * Loud failure modes — over-cap GetBulk answers an RFC 3416 `tooBig` error PDU instead of silently truncating
   * Hardware-validated: ESP8266 30-minute soak campaigns, 0 pool alarms / 0 reboots / flat heap
 
@@ -443,6 +443,17 @@ Two honesty notes that the harness proved rather than assumed:
   consistent in every case.
 
 ## Version History
+
+- **v3.4.2** — **True zero-heap packet path**: the `std::shared_ptr` wrappers
+  that silently cost a heap control block per construction (~9–11 per packet on
+  the zero-copy path, ~10× that on the classic path) are replaced by the
+  move-only, pool-owning `AsnPtr<T>`. Measured with a per-packet allocation
+  census: **0 heap allocations per GET/SET/GETNEXT/GETBULK on both paths**
+  (was 11/9/9/2 zero-copy, 94/87/94/42 classic). New protected virtual
+  `buildTypeWithValueRaw()` returns the pool-owned value directly; the old
+  `buildTypeWithValue()` remains as a deprecated bridge for external
+  subclasses (one control block per GET — migrate when convenient). No sketch
+  changes required. See the [CHANGELOG](CHANGELOG.md).
 
 - **v3.4.1** — **`SNMP_NO_TRAPS`**: compile-time removal of the whole trap/inform
   subsystem for request-only endpoints (loud compile errors on accidental trap

@@ -4,23 +4,9 @@
 #include "include/SNMPParser.h"
 #include "include/defs.h"
 
-/* Pool object deleter helper — must match the deleter used in SNMPPacket.cpp.
- * asn_delete() correctly returns a pool-allocated BER_CONTAINER slot back to
- * the ASNPool free-list instead of calling operator delete (which would UB
- * on a placement-new'd slot in the static pool, corrupting the pool metadata
- * and silently dropping all responses on ESP8266). */
-namespace {
-    struct trap_pool_deleter {
-        template <typename T>
-        void operator()(T* p) const noexcept {
-            asn_delete(static_cast<BER_CONTAINER*>(p));
-        }
-    };
-}
-
-std::shared_ptr<ComplexType> SNMPTrap::generateVarBindList(){
-    return std::shared_ptr<ComplexType>(generateVarBindListRaw(), trap_pool_deleter());
-}
+/* v3.4.2: the shared_ptr generateVarBindList() override was removed with the
+ * virtual itself (zero callers; each construction cost a heap control block
+ * — Report_001 finding #1).  Trap building goes through generateVarBindListRaw(). */
 
 /* v3.3.4: trap sysUpTime resolution order —
  *   1. sketch-supplied callback (unchanged pre-3.3.4 behaviour)
@@ -65,8 +51,8 @@ static bool _trap_build_fill_pdu(ComplexType* trapPDU, void* userdata){
     /* v3.3.4: sketch callback wins; else the library built-in uptime supplies
      * a live value (see SNMPTrap::effectiveUptimeCallback). */
     if(TimestampCallback* up = self->effectiveUptimeCallback()){
-        auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(up));
-        if(sp) trapPDU->addValueToListRaw(asn_new<TimestampType>(sp->_value));
+        AsnPtr<BER_CONTAINER> ts = ValueCallback::getValueForCallback(up);
+        if(ts) trapPDU->addValueToListRaw(asn_new<TimestampType>(static_cast<TimestampType*>(ts.get())->_value));
         else   trapPDU->addValueToListRaw(asn_new<TimestampType>(0));
     } else {
         trapPDU->addValueToListRaw(asn_new<TimestampType>(0));
@@ -108,8 +94,8 @@ ComplexType* SNMPTrap::generateVarBindListRaw(){
         /* v3.3.4: same resolution order as the v1 trap path — sketch callback,
          * else the library built-in uptime. */
         if(TimestampCallback* up = effectiveUptimeCallback()){
-            auto sp = std::static_pointer_cast<TimestampType>(ValueCallback::getValueForCallback(up));
-            if(sp) timestampVarBind->addValueToListRaw(asn_new<TimestampType>(sp->_value));
+            AsnPtr<BER_CONTAINER> ts = ValueCallback::getValueForCallback(up);
+            if(ts) timestampVarBind->addValueToListRaw(asn_new<TimestampType>(static_cast<TimestampType*>(ts.get())->_value));
             else   timestampVarBind->addValueToListRaw(asn_new<TimestampType>(0));
         } else {
             timestampVarBind->addValueToListRaw(asn_new<TimestampType>(0));
@@ -141,7 +127,7 @@ ComplexType* SNMPTrap::generateVarBindListRaw(){
 
         varBind->addValueToListRaw(value->OID->cloneRaw());
 
-        auto valueSP = ValueCallback::getValueForCallback(value);
+        AsnPtr<BER_CONTAINER> valueSP = ValueCallback::getValueForCallback(value);
         BER_CONTAINER* src = valueSP.get();
         BER_CONTAINER* clonedValue = nullptr;
         if(!src){

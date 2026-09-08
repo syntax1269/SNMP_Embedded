@@ -176,6 +176,81 @@ static inline T* asn_new(Args&&... args){
 
 void asn_delete(BER_CONTAINER* p);
 
+/* v3.4.2: deep-clone any BER_CONTAINER into a fresh pool object (switch on
+ * _type).  Returns nullptr for a null src or on pool exhaustion.  Used by
+ * the deprecated buildTypeWithValue() bridge (the legacy shared_ptr cannot
+ * be disarmed, so its value is cloned out) and available to any caller that
+ * needs container duplication without knowing the concrete class. */
+BER_CONTAINER* asn_clone(const BER_CONTAINER* src);
+
+/* ========================================================================
+ * v3.4.2 — AsnPtr<T>: move-only owning pointer for pool-allocated ASN
+ * containers.  Replaces std::shared_ptr in the packet hot path.
+ *
+ * WHY IT EXISTS (Report_001 finding #1): a shared_ptr built from a raw
+ * pointer always heap-allocates a control block (~16-32 B: refcounts,
+ * deleter, vptr).  Pool-allocating the pointee does not make the
+ * bookkeeping heap-free — so "zero per-packet heap traffic" was not true
+ * while the hot path built shared_ptrs.  AsnPtr has exactly one member
+ * (the pointer) and routes destruction through the existing asn_delete(),
+ * so the pool's occupancy machinery IS the ownership record — nothing is
+ * added to ASNPool::Slot and nothing touches the heap.
+ *
+ * OWNERSHIP MODEL: move-only, single owner, no refcount.  Verified against
+ * the whole tree: no shared_ptr in the packet path ever shares — VarBind
+ * deep-clones shared_ptr content into its own raw owning pointer, the
+ * inform queue is stateless (pool freed at each send), and every shared_ptr
+ * is confined to one function scope or one packet's lifetime.  Move-only
+ * makes the historic bug class (pool address handed to plain delete)
+ * structurally impossible: the only destruction path is asn_delete.
+ *
+ * LIFETIME CONTRACT: identical to the shared_ptr+PoolDeleter scheme it
+ * replaces — asn_delete() tolerates stale (bulkFreed) slots silently and
+ * alarms only on true double-destroy; all v3.3.3 pool tests carry over
+ * unchanged.
+ * ======================================================================== */
+template<typename T>
+class AsnPtr {
+    T* p_;
+public:
+    explicit AsnPtr(T* raw = nullptr) noexcept : p_(raw) {}
+    /* non-explicit: `return nullptr;` in a factory means "empty" exactly as
+     * it did in the shared_ptr era. */
+    AsnPtr(std::nullptr_t) noexcept : p_(nullptr) {}
+    ~AsnPtr(){ if(p_){ asn_delete(static_cast<BER_CONTAINER*>(p_)); p_ = nullptr; } }
+
+    AsnPtr(const AsnPtr&) = delete;
+    AsnPtr& operator=(const AsnPtr&) = delete;
+
+    AsnPtr(AsnPtr&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+    AsnPtr& operator=(AsnPtr&& o) noexcept {
+        if(this != &o){
+            if(p_) asn_delete(static_cast<BER_CONTAINER*>(p_));
+            p_ = o.p_; o.p_ = nullptr;
+        }
+        return *this;
+    }
+
+    T* get() const noexcept { return p_; }
+    T* operator->() const noexcept { return p_; }
+    T& operator*() const noexcept { return *p_; }
+    explicit operator bool() const noexcept { return p_ != nullptr; }
+
+    /* Explicit ownership transfer OUT of the guard (raw pointer handed to
+     * a raw-owning API, e.g. VarBind's owning value_ member).  The guard
+     * is disarmed: the caller now owns the object. */
+    T* release() noexcept { T* p = p_; p_ = nullptr; return p; }
+
+    /* Explicit ownership transfer IN (disarms the source). */
+    void reset(T* raw = nullptr) noexcept {
+        if(p_ != raw){
+            if(p_) asn_delete(static_cast<BER_CONTAINER*>(p_));
+            p_ = raw;
+        }
+    }
+    void swap(AsnPtr& o) noexcept { T* t = p_; p_ = o.p_; o.p_ = t; }
+};
+
 typedef enum ASN_TYPE_WITH_VALUE {
     // Primatives
     INTEGER = 0x02,
@@ -382,10 +457,9 @@ class OIDType: public BER_CONTAINER {
         _init_from_cstr(value, cap);
     }
 
-    std::shared_ptr<OIDType> cloneOID() const {
-        return std::shared_ptr<OIDType>(asn_new<OIDType>(this->_valueStr, this->data, this->dataLen, this->valid),
-                                        [](OIDType* p){ asn_delete(static_cast<BER_CONTAINER*>(p)); });
-    }
+    /* v3.4.2: cloneOID() (shared_ptr form) removed — cloneRaw() is the one
+     * clone path, and every former cloneOID() call site now owns its clone
+     * directly (zero control blocks). */
 
     OIDType* cloneRaw() const {
         return asn_new<OIDType>(this->_valueStr, this->data, this->dataLen, this->valid);
@@ -400,14 +474,21 @@ class OIDType: public BER_CONTAINER {
     const uint8_t* encodedData() const { return data; }
     int encodedLen() const { return dataLen; }
 
-    bool equals(const std::shared_ptr<OIDType> oid) const {
+    /* v3.4.2: raw-pointer overload — comparing against a raw OIDType must
+     * NOT implicitly construct a shared_ptr (control-block heap alloc per
+     * comparison, and the temporary's default-delete would target a
+     * non-owning pool pointer). */
+    bool equals(const OIDType* oid) const {
         return this->dataLen == oid->dataLen &&
                (this->dataLen == 0 || memcmp(this->data, oid->data, (size_t)this->dataLen) == 0);
     }
 
-    bool equals(const OIDType* oid) const {
-        return this->dataLen == oid->dataLen &&
-               (this->dataLen == 0 || memcmp(this->data, oid->data, (size_t)this->dataLen) == 0);
+    bool equals(const OIDType& oid) const {
+        return this->equals(&oid);
+    }
+
+    bool equals(const std::shared_ptr<OIDType> oid) const {
+        return this->equals(oid.get());
     }
 
     bool isSubTreeOf(const OIDType* const oid){

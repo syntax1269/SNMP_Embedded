@@ -106,6 +106,38 @@ void asn_delete(BER_CONTAINER* p){
         delete p;
     }
 }
+
+BER_CONTAINER* asn_clone(const BER_CONTAINER* src){
+    if(!src) return nullptr;
+    switch(src->_type){
+        case INTEGER:        return asn_new<IntegerType>(static_cast<const IntegerType*>(src)->_value);
+        case STRING:
+        {
+            const OctetType* so = static_cast<const OctetType*>(src);
+            return asn_new<OctetType>(so->_value, so->_valueLen);
+        }
+        case ASN_TYPE::OID:  return static_cast<const OIDType*>(src)->cloneRaw();
+        case NULLTYPE:       return asn_new<NullType>();
+        case NOSUCHOBJECT:   return asn_new<ImplicitNullType>(NOSUCHOBJECT);
+        case NOSUCHINSTANCE: return asn_new<ImplicitNullType>(NOSUCHINSTANCE);
+        case ENDOFMIBVIEW:   return asn_new<ImplicitNullType>(ENDOFMIBVIEW);
+        case NETWORK_ADDRESS:
+        {
+            const NetworkAddress* so = static_cast<const NetworkAddress*>(src);
+            return asn_new<NetworkAddress>(so->_value);
+        }
+        case TIMESTAMP:      return asn_new<TimestampType>(static_cast<const TimestampType*>(src)->_value);
+        case COUNTER32:      return asn_new<Counter32>(static_cast<const Counter32*>(src)->_value);
+        case GAUGE32:        return asn_new<Gauge>(static_cast<const Gauge*>(src)->_value);
+        case COUNTER64:      return asn_new<Counter64>(static_cast<const Counter64*>(src)->_value);
+        case OPAQUE:
+        {
+            const OpaqueType* so = static_cast<const OpaqueType*>(src);
+            return asn_new<OpaqueType>(so->_value, so->_dataLength);
+        }
+        default:             return asn_new<NullType>();
+    }
+}
 // Two ways to decode an int, one way where the first byte indicates how many butes follow, and ne where you have to power things by 128
 static size_t decode_ber_longform_integer(const uint8_t* buf, long* decoded_integer, int max_len){
     int i = 1;

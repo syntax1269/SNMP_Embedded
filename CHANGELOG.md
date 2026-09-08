@@ -1,5 +1,55 @@
 # Changelog — SNMP_Embedded
 
+## v3.4.2 — True zero-heap packet path (AsnPtr)
+
+### Fixed
+- **Report_001 finding #1 — the "zero heap" claim was not actually true.** Every
+  `std::shared_ptr` in the packet hot path wrapped a pool-allocated object with
+  a custom deleter, but each construction still heap-allocated a control block
+  (~16–32 B). A p768 GET response paid ~9–11 control blocks per packet; the
+  classic (zero-copy-off) path paid ~10× that. At flood rates that is ~100+
+  malloc/free pairs per second on an ESP8266.
+
+### Added
+- **`AsnPtr<T>`** (`BER.h`): move-only, single-ownership pointer whose destructor
+  routes through the existing `asn_delete`. Zero heap, zero new pool metadata —
+  the pool's occupancy machinery *is* the ownership record. Move-only makes the
+  former bug class (pool address handed to `delete`) structurally impossible.
+  Covered by 25 new unit tests including the stale-`bulkFreed` tolerance
+  contract carried over from the v3.3.3 hardware campaign.
+- **`buildTypeWithValueRaw()`** (protected virtual on `ValueCallback`): the
+  optimized factory that returns a pool-owning `AsnPtr<BER_CONTAINER>` directly.
+  The old `buildTypeWithValue()` stays as a deprecated bridge: an external
+  subclass still overriding it works unchanged, at the cost of one control
+  block per GET (its `shared_ptr` is deep-cloned into pool storage). Removal
+  earmarked for the next major.
+- **Per-packet heap-allocation census** (host suite, `[v342]` tag): a scoped
+  global `operator new` counter proves **0 heap allocations per
+  GET/SET/GETNEXT/GETBULK on both packet paths**, with pool-drift assertions
+  after every window. The harness DIAG gained a per-tick `hdiff` heap-delta
+  readout (net drift detector on hardware).
+
+### Changed
+- All packet-path shared_ptr construction sites migrated: the 12
+  `ValueCallback` factories, `SNMPPacket` header fields + parse-time varbind
+  cloning (now raw pool clones), `SNMPPDUHandler` response assembly,
+  `SNMPZeroCopy` decode/response staging, and the trap/inform varbind list.
+  The unused `shared_ptr generateVarBindList()` virtual was removed (zero
+  callers); `OIDType::cloneRaw()` is the single clone path. `OIDType::equals()`
+  gained a raw-pointer overload — the shared_ptr-by-value form implicitly
+  constructed a control block per comparison.
+
+### Validation
+- Host matrix: default **2,167 assertions / 30 cases**, zero-copy-off **304 / 25**,
+  no-builtin-uptime **2,099 / 25**, no-traps **2,085 / 25** — all green.
+- Census before/after: zero-copy GET 11→**0**, SET 9→**0**, GETNEXT 9→**0**,
+  GETBULK 2→**0**; classic GET 94→**0**, SET 87→**0**, GETNEXT 94→**0**,
+  GETBULK 42→**0**.
+- Hardware (ESP8266 ESP-01, p768): 1-min flood **183 ops / 0 fails**, 5-min flood
+  **903 ops / 0 fails**, pool 27/33 throughout, **`hdiff_avg=0`** (zero net heap
+  drift across ~1.1M ticks), 0 alarms / 0 crashes / 0 reboots, banner
+  `hwtest_3.4.2-p768` proven on the wire.
+
 ## v3.4.1 — SNMP_NO_TRAPS: compile-time trap/inform removal
 
 ### Added

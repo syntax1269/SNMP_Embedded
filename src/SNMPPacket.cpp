@@ -2,34 +2,9 @@
 
 #define SNMP_PARSE_ERROR_AT_STATE(STATE) ((int)STATE * -1) - 10 + SNMP_PACKET_PARSE_ERROR_OFFSET
 
-/* ASNPool objects are NOT allocated via `new`/`malloc`.  They live in a
- * statically-allocated placement-new pool (ASNPool::Slot[N]).  When a
- * `std::shared_ptr<T>` takes ownership of a pool-allocated pointer via
- * the default `delete T` deleter, it calls `delete` on a pool address →
- * Undefined Behavior.  Unchecked, this manifests as a silent SNMP agent
- * death on ESP8266: UDP packets arrived (confirmed in T1 loop diagnostic)
- * but ZERO response packets were ever built/sent.  Pool metadata was
- * corrupted by the bogus `delete`, causing ASNPool allocations for the
- * response encode path to return nullptr → silently dropped.
- *
- * FIX: use an `asn_delete` deleter for every shared_ptr that wraps
- * `asn_new<T>(...)`.  `asn_delete` correctly returns the slot to the
- * pool (or no-ops if the object was actually on heap via COMPILING_TESTS
- * fallback malloc).   The pool also auto-resets on every loop() tick, so
- * even a no-op deleter is safe.  But using `asn_delete` is proper and
- * also works correctly in host-based unit tests that malloc. */
-template <typename T>
-static void pool_asn_deleter(T* p) noexcept {
-    asn_delete(static_cast<BER_CONTAINER*>(p));
-}
-
-/* Convenience helper: wraps a pool-allocated pointer in shared_ptr with
- * an deleter that calls asn_delete() instead of operator delete.  This
- * MUST be used for every `shared_ptr = asn_new<T>(...)` assignment. */
-template <typename T>
-static inline std::shared_ptr<T> pool_shared(T* p) noexcept {
-    return std::shared_ptr<T>(p, pool_asn_deleter<T>);
-}
+/* v3.4.2: pool_shared/pool_asn_deleter removed — the packet hot path is
+ * fully AsnPtr-based (zero heap).  The former shared_ptr wrappers each
+ * cost a heap control block per construction (Report_001 finding #1). */
 
 #define ASN_TYPE_FOR_STATE_SNMPVERSION  INTEGER
 #define ASN_TYPE_FOR_STATE_COMMUNITY    STRING
@@ -72,7 +47,7 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
 
             case SNMPVERSION:
                 ASSERT_ASN_STATE_TYPE(value, SNMPVERSION);
-                this->snmpVersionPtr = pool_shared(asn_new<IntegerType>(static_cast<IntegerType*>(value)->_value));
+                this->snmpVersionPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(static_cast<IntegerType*>(value)->_value));
                 this->snmpVersion = (SNMP_VERSION) this->snmpVersionPtr.get()->_value;
                 if (this->snmpVersion >= SNMP_VERSION_MAX) {
                     SNMP_LOGW("Invalid SNMP Version: %d\n", this->snmpVersion);
@@ -85,7 +60,7 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
                 ASSERT_ASN_STATE_TYPE(value, COMMUNITY);
                 {
                     OctetType* src = static_cast<OctetType*>(value);
-                    this->communityStringPtr = pool_shared(asn_new<OctetType>(src->_value, src->_valueLen));
+                    this->communityStringPtr = AsnPtr<OctetType>(asn_new<OctetType>(src->_value, src->_valueLen));
                 }
                 {
                     size_t len = this->communityStringPtr.get()->_valueLen;
@@ -108,7 +83,7 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
 
             case REQUESTID:
                 ASSERT_ASN_STATE_TYPE(value, REQUESTID);
-                this->requestIDPtr = pool_shared(asn_new<IntegerType>(static_cast<IntegerType*>(value)->_value));
+                this->requestIDPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(static_cast<IntegerType*>(value)->_value));
                 this->requestID = this->requestIDPtr.get()->_value;
                 state = ERRORSTATUS;
             break;
@@ -148,13 +123,13 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
 
                 BER_CONTAINER* vbValue = varbindValues->values[1];
 
-                /* Clone the OID so the VarBind holds an owning reference independent
-                 * of the incoming ComplexType tree (which will be delete'd when the
-                 * SNMPPacket object is reused or destroyed).  For value we wrap with
-                 * a no-op deleter: the caller's lifetime (packet processing + reply
-                 * serialise) always happens before packet destruction. */
-                std::shared_ptr<OIDType> oidClone = static_cast<OIDType*>(vbOid)->cloneOID();
-                std::shared_ptr<BER_CONTAINER> valueView(vbValue, [](BER_CONTAINER*){});
+                /* v3.4.2: raw pool clones — the VarBind owns both members
+                 * outright (no shared_ptr view, no control blocks).  The
+                 * incoming ComplexType tree outlives the emplaced VarBind
+                 * within parsePacket's scope, and the VarBind's own deep
+                 * copies are independent of it after construction. */
+                OIDType* oidClone = static_cast<OIDType*>(vbOid)->cloneRaw();
+                BER_CONTAINER* valueClone = VarBind::cloneValueOrNull(vbValue, vbValue ? vbValue->_type : NULLTYPE);
 
                 /* LOUD REJECT on capacity overflow. The former behavior
                  * silently dropped varbinds past SNMP_MAX_VARBINDS, so a
@@ -164,7 +139,7 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
                  * (handlePacket() maps it to SNMP_REQUEST_INVALID — no
                  * response). Mirrors the community-cap policy:
                  * truncation replaced with explicit reject. */
-                if(!this->emplace_back(oidClone, valueView)){
+                if(!this->emplace_back(oidClone, valueClone)){
                     SNMP_LOGW("Request varbind #%d exceeds SNMP_MAX_VARBINDS (%d): REJECTING packet (was: silently truncated). Raise SNMP_MAX_VARBINDS via sketch #define before #include <SNMP_Embedded.h>.\n",
                               this->varbindCount + 1, SNMP_MAX_VARBINDS);
                     return SNMP_PARSE_ERROR_AT_STATE(VARBIND);
@@ -327,10 +302,6 @@ ComplexType* SNMPPacket::generateVarBindListRaw(){
     }
 
     return list;
-}
-
-std::shared_ptr<ComplexType> SNMPPacket::generateVarBindList(){
-    return pool_shared(generateVarBindListRaw());
 }
 
 snmp_request_id_t SNMPPacket::generate_request_id(){
