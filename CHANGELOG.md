@@ -1,6 +1,6 @@
 # Changelog — SNMP_Embedded
 
-## v3.4.4 — P1 runtime/high-water statistics (blueprint Phase 1)
+## v3.4.4 — Runtime/high-water statistics and bounded memory
 
 ### Added
 - **`SNMP_RuntimeStats`** (public struct) + **`SNMPAgent::getRuntimeStats(SNMP_RuntimeStats*)`**:
@@ -14,11 +14,10 @@
   this library instance can consume (pool arena + packet buffer + worst-case
   varbind array) — completes the P0 bounded-memory proof as a single number
   per configuration, with a build-time `static_assert` sanity check.
-- Six new host test cases `[snmp][v344]`: valid traffic leaves counters at
-  baseline; malformed / rejected / tooBig / allocation-failure each move
-  exactly their own counter; `getRuntimeStats` snapshot correctness incl.
-  `packets_received` through a feeding-UDP `loop()`; the bounded-RAM constant
-  sanity. The mock UDP stub is now virtual so tests can feed datagrams.
+- Runtime-statistics coverage verifies valid traffic, malformed traffic,
+  community rejection, tooBig responses, allocation failures, snapshots, and
+  the bounded-RAM constant. Counters are validated through the normal agent
+  loop with both packet paths.
 
 ### Counting contract (both packet paths)
 - `malformed_packets` and `packets_rejected` are mutually exclusive (a packet
@@ -34,25 +33,20 @@
 ### Validation
 - Host matrix: default **2,193 assertions / 38 cases**, zero-copy-off **330 / 33**,
   no-builtin-uptime **2,125 / 33**, no-traps **2,111 / 33** — all green.
-- Fuzz (ASAN/UBSAN): unchanged green — 20,014 inputs, zero runtime errors.
+- Adversarial-input validation: 20,014 inputs, zero runtime errors.
 
-## v3.4.3 — P0 parser fuzzing (blueprint Phase 3): two real decoder bugs found and fixed
+## v3.4.3 — Parser hardening: two decoder bugs found and fixed
 
 ### Added
-- **Standalone deterministic fuzz harness** (`tests/fuzz/fuzz_parser.cpp`, targets
-  `make fuzz` / `make fuzz-asan`): hammers both packet paths (`handlePacket`
-  classic + `handlePacketInPlace` zero-copy), the `snmp_ber_peek_packet` view
-  walk, and the container `fromBuffer` decode with a 14-kind structured
-  adversarial corpus (truncated/invalid BER, corrupt length fields, deep TLV
-  nesting, invalid OIDs, huge integers, malformed SET/GETBULK, all-0xFF,
-  all-0x00, random garbage) plus seeded mutation campaigns.  After every input
-  it verifies the blueprint invariants: no crash, no hang, no OOB read/write,
-  input buffer never mutated, pool returns to its registered-handler baseline.
-  Deterministic (fixed default seed, `--seed`/`--cases`/`--maxlen` flags);
-  ASAN+UBSAN build runs the same corpus.  Wired into CI after the host suite.
-- **Regression tests** for the two findings below (`[snmp][v343][fuzz]`).
+- A deterministic adversarial-input campaign exercised both packet paths,
+  the in-place BER view walk, and container decoding with truncated and invalid
+  BER, corrupt length fields, deep nesting, invalid OIDs, huge integers,
+  malformed SET/GETBULK, all-`0xff`, all-zero, and random packet data, followed
+  by seeded mutations. Each input was checked for safe rejection, unchanged
+  input storage, and restoration of the registered-handler pool baseline.
+- Regression coverage was added for both findings below.
 
-### Fixed (both found by the fuzzer)
+### Fixed (both found by adversarial-input validation)
 - **F1 — unbounded BER length-field read (out-of-bounds).**
   `decode_ber_length_integer()` read the long-form length field with no bound
   check: a header like `02 94` (long form claiming 20 length bytes) made it
@@ -60,22 +54,22 @@
   decoder now rejects length fields that run off the buffer, use the
   indefinite form, or exceed 4 length bytes (> 2^32-1 content) — the same
   strictness `ber_decode_length()` in the zero-copy path already had.
-- **F2 — invalid SNMP_VERSION enum cast (undefined behaviour, UBSan).**
+- **F2 — invalid SNMP_VERSION enum cast (undefined behaviour).**
   A hostile version integer (e.g. 0xFFFFFFFF) was cast to the `SNMP_VERSION`
-  enum *before* the range check; the enum load itself was UB.  The raw
+  enum before the range check.  The raw
   integer is now validated against `[0, SNMP_VERSION_MAX)` first, then cast.
 
 ### Validation
-- Fuzzer: 20,014 inputs per run (14 corpora x both paths + view walk + container
-  decode) green; six seeds x 50k mutations @ 1400 B budget green under
-  ASAN+UBSAN with zero runtime errors.
+- Adversarial-input validation: 20,014 inputs per run across both paths, the
+  view walk, and container decoding; six seeds of mutations at the 1400 B
+  budget completed with zero runtime errors.
 - Host matrix: default **2,170 assertions / 32 cases**, zero-copy-off **307 / 27**,
   no-builtin-uptime **2,103 / 27**, no-traps **2,089 / 27** — all green.
 
 ## v3.4.2 — True zero-heap packet path (AsnPtr)
 
 ### Fixed
-- **Report_001 finding #1 — the "zero heap" claim was not actually true.** Every
+- **The previous "zero heap" claim was not actually true.** Every
   `std::shared_ptr` in the packet hot path wrapped a pool-allocated object with
   a custom deleter, but each construction still heap-allocated a control block
   (~16–32 B). A p768 GET response paid ~9–11 control blocks per packet; the
@@ -95,11 +89,11 @@
   subclass still overriding it works unchanged, at the cost of one control
   block per GET (its `shared_ptr` is deep-cloned into pool storage). Removal
   earmarked for the next major.
-- **Per-packet heap-allocation census** (host suite, `[v342]` tag): a scoped
-  global `operator new` counter proves **0 heap allocations per
+- **Per-packet heap-allocation measurement:** a scoped global allocation
+  counter proves **0 heap allocations per
   GET/SET/GETNEXT/GETBULK on both packet paths**, with pool-drift assertions
-  after every window. The harness DIAG gained a per-tick `hdiff` heap-delta
-  readout (net drift detector on hardware).
+  after every measurement window. Hardware diagnostics also report the
+  per-tick `hdiff` heap-delta readout.
 
 ### Changed
 - All packet-path shared_ptr construction sites migrated: the 12
@@ -134,7 +128,7 @@
   - the pool formula drops the 16-slot trap-tree term:
     `pool = 2*SNMP_MAX_VARBINDS + 4 + SNMP_MAX_CALLBACKS_PER_AGENT`
     (13-handler 768-B profile: 25 slots instead of 33).
-- `test-notraps` host profile (CI: `ci-test-notraps`) — the full suite minus the
+- `test-notraps` validation profile — the full suite minus the
   five trap/inform cases, plus a formula case with `static_assert` proof that the
   trap-tree term is zero and the pool derivation is exact.
 - `#error` guard: `SNMP_NO_TRAPS=1` together with `SNMP_TRAP_VB_RESERVE > 0`
@@ -145,7 +139,7 @@
   compile objects into `tests/src/` (the `../src` in the object path escapes the
   build dir), so two profile builds run back-to-back silently reused each other's
   objects. Every non-default profile target now clears the shared directory first
-  (CI on clean checkouts was unaffected; local back-to-back runs were not).
+  (clean checkouts were unaffected; local back-to-back runs were not).
 
 ### Validation
 - Host matrix: default **2,125 assertions / 28 cases**, zero-copy-off **262 / 23**,
@@ -153,7 +147,7 @@
   counts identical to v3.4.0 (flag-off is behavior-identical).
 - Loud-failure probe: instantiating `SNMPTrap` under the flag fails at compile
   time with the flag named in the message.
-- Hardware (ESP8266 ESP-01, standardized flood harness, flag off): 1-min and
+- Hardware (ESP8266 ESP-01, standard flood campaign, flag off): 1-min and
   5-min unpaced soaks PASS — pool 27/33, heap floor 32,496 B, frag ≤1 %,
   0 alarms / 0 crashes / 0 reboots.
 
@@ -174,7 +168,7 @@ byte-for-byte response comparison across GET / GETNEXT / GETBULK / SET / error p
   Handler dispatch matches raw encoded-OID bytes (`memcmp`) — exactly the bytes
   that define sort order, so walk semantics are exact.
 - **`SNMP_ZERO_COPY=0`** global build flag: restores the classic container path
-  unchanged (field escape hatch; kept compiling in CI as `make test-nozc`).
+  unchanged (field escape hatch; the compatibility path remains available).
 - **`SNMP_TRAP_VB_RESERVE`** global build flag (default 0): sketches that attach
   varbinds to traps reserve 3 pool slots per trap varbind. Unreserved overflow
   fails loudly (pool-exhausted log, trap not sent) — same behavior as all
@@ -205,7 +199,7 @@ handler parity, tooBig boundaries).
   moved in this release (one variable at a time — the slot savings are banked
   as measured heap headroom).
 
-### Measured on hardware (ESP8266 ESP-01, standardized flood harness, full CSV history)
+### Measured on hardware (ESP8266 ESP-01, repeatable flood measurements)
 
 | Metric | v3.3.6 | v3.4.0 | Delta |
 |---|---|---|---|
@@ -224,13 +218,12 @@ Hardware validation: per profile, 1-minute, 5-minute, and 15-minute flood soaks
 inform-queue-saturation stress profile; 0 pool alarms, 0 crashes, 0 reboots
 across the entire campaign.
 
-### Internal
+### Compatibility and measurement notes
 
-- Phase-gated development with measured decision gates: Strategy A/B OID-matching
-  benchmark (A: memcmp won 3–4.6× with far lower stack cost; B removed),
-  BerWriter byte-equivalence proof, staged response plans (all request slices
-  staged before any response byte is written — immune to buffer aliasing),
-  worst-tick calibration stress probe, and a fully source-cited pool formula.
+- Strategy A raw-byte OID matching is retained because it provides the smallest
+  memory cost and best measured lookup time for the supported handler roster.
+  Response slices are staged before serialization, preventing buffer aliasing.
+  The pool formula is derived from the actual transient and permanent consumers.
 
 ---
 
@@ -306,7 +299,7 @@ across the entire campaign.
   round-trip, SKIP semantics, deduced-capacity overflow refusal, and pointer-
   form interop. Opt-out profile unchanged (175 / 17, both exit 0).
 - Compile matrix re-verified 8/8 (2 examples × 2 platforms + 2 CLI demos +
-  PlatformIO minimal × 2 envs). Hardware re-verified on ESP8266: clean boot,
+  minimal example profiles). Hardware re-verified on ESP8266: clean boot,
   1-minute flood soak (104 ops, 0 pool alarms, 0 crashes, 1 WiFi transport
   timeout).
 
@@ -343,8 +336,8 @@ across the entire campaign.
   registration counts, request-time computation with an injected fake clock,
   sparse/full/zero-OID helper selection, loud validation errors (RW string
   `len=0` refused), gap-GET `noSuchObject` behaviour, and registry hygiene.
-  New opt-out CI profile: `make ci-test-nobuiltinuptime` (175 assertions green
-  under `SNMP_NO_BUILTIN_SYSUPTIME`).
+  The no-built-in-uptime configuration is validated with the same behavior
+  checks under `SNMP_NO_BUILTIN_SYSUPTIME`.
 - All five sketches (2 `examples/`, 3 `extras/demos/`) now teach the system
   group: full 6-OID + manual sysObjectID, sysDescr-only minimal, sparse
   3-OID gap demo, sparse + live-uptime, and a zero-system-OID stripped build.
@@ -378,7 +371,7 @@ across the entire campaign.
 
 ### Fixed
 
-- PlatformIO strict builds (`-Werror=empty-body`): braced the logging `else`
+- Strict warning builds (`-Werror=empty-body`): braced the logging `else`
   branches in the helper so disabled-log builds stay warning-clean on GCC.
 - ESP32 type strictness: the helper's sysServices parameter is `int*`
   (matching `addIntegerHandler`); `int32_t*` does not convert on ESP32 where
