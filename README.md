@@ -444,6 +444,13 @@ Two honesty notes that the harness proved rather than assumed:
 
 ## Version History
 
+- **v3.4.3** — **P0 parser fuzzing (production hardening, blueprint Phase 3).**
+  A deterministic host fuzzer (structured adversarial corpus + seeded
+  mutations over both packet paths, the view walk, and container decode,
+  under ASAN/UBSAN) found and fixed two real decoder bugs: an unbounded
+  long-form BER length-field read (OOB, container path) and an invalid
+  `SNMP_VERSION` enum cast (UB).  Malformed packets are now rejected with
+  the same strictness on every path. See the [CHANGELOG](CHANGELOG.md).
 - **v3.4.2** — **True zero-heap packet path**: the `std::shared_ptr` wrappers
   that silently cost a heap control block per construction (~9–11 per packet on
   the zero-copy path, ~10× that on the classic path) are replaced by the

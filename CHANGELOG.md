@@ -1,5 +1,41 @@
 # Changelog — SNMP_Embedded
 
+## v3.4.3 — P0 parser fuzzing (blueprint Phase 3): two real decoder bugs found and fixed
+
+### Added
+- **Standalone deterministic fuzz harness** (`tests/fuzz/fuzz_parser.cpp`, targets
+  `make fuzz` / `make fuzz-asan`): hammers both packet paths (`handlePacket`
+  classic + `handlePacketInPlace` zero-copy), the `snmp_ber_peek_packet` view
+  walk, and the container `fromBuffer` decode with a 14-kind structured
+  adversarial corpus (truncated/invalid BER, corrupt length fields, deep TLV
+  nesting, invalid OIDs, huge integers, malformed SET/GETBULK, all-0xFF,
+  all-0x00, random garbage) plus seeded mutation campaigns.  After every input
+  it verifies the blueprint invariants: no crash, no hang, no OOB read/write,
+  input buffer never mutated, pool returns to its registered-handler baseline.
+  Deterministic (fixed default seed, `--seed`/`--cases`/`--maxlen` flags);
+  ASAN+UBSAN build runs the same corpus.  Wired into CI after the host suite.
+- **Regression tests** for the two findings below (`[snmp][v343][fuzz]`).
+
+### Fixed (both found by the fuzzer)
+- **F1 — unbounded BER length-field read (out-of-bounds).**
+  `decode_ber_length_integer()` read the long-form length field with no bound
+  check: a header like `02 94` (long form claiming 20 length bytes) made it
+  read up to 127 bytes past the caller's buffer on the container path.  The
+  decoder now rejects length fields that run off the buffer, use the
+  indefinite form, or exceed 4 length bytes (> 2^32-1 content) — the same
+  strictness `ber_decode_length()` in the zero-copy path already had.
+- **F2 — invalid SNMP_VERSION enum cast (undefined behaviour, UBSan).**
+  A hostile version integer (e.g. 0xFFFFFFFF) was cast to the `SNMP_VERSION`
+  enum *before* the range check; the enum load itself was UB.  The raw
+  integer is now validated against `[0, SNMP_VERSION_MAX)` first, then cast.
+
+### Validation
+- Fuzzer: 20,014 inputs per run (14 corpora x both paths + view walk + container
+  decode) green; six seeds x 50k mutations @ 1400 B budget green under
+  ASAN+UBSAN with zero runtime errors.
+- Host matrix: default **2,170 assertions / 32 cases**, zero-copy-off **307 / 27**,
+  no-builtin-uptime **2,103 / 27**, no-traps **2,089 / 27** — all green.
+
 ## v3.4.2 — True zero-heap packet path (AsnPtr)
 
 ### Fixed

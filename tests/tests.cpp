@@ -2443,3 +2443,73 @@ TEST_CASE( "v3.4.2 phase1: AsnPtr move-only pool-owning pointer", "[snmp][v342]"
     }
     REQUIRE( ASNPool::doubleReleaseAlarms == alarmsBefore );
 }
+
+/* ==========================================================================
+ * v3.4.3 — regression tests for fuzzing findings (blueprint Phase 3).
+ * F1: decode_ber_length_integer read past the buffer on a long-form length
+ *     field (`02 94` = 20 length bytes claimed) — the container path now
+ *     rejects malformed length fields instead of OOB-reading.
+ * F2: a hostile version field (e.g. 0xFFFFFFFF) was cast to the SNMP_VERSION
+ *     enum before the range check — UB per UBSan.  Raw int validated first.
+ * ========================================================================== */
+TEST_CASE( "v3.4.3 fuzz F1: long-form BER length field cannot overrun the buffer", "[snmp][v343][fuzz]" ){
+
+    /* INTEGER tag 0x02, length 0x94 = long form with 20 length bytes — the
+     * old decoder read up to 127 bytes past the 3-byte buffer. */
+    uint8_t malformed[3] = { 0x02, 0x94, 0x01 };
+    int before = ASNPool::doubleReleaseAlarms;
+
+    BER_CONTAINER* it = asn_new<IntegerType>();
+    int rc = it->fromBuffer(malformed, sizeof(malformed));
+    REQUIRE( rc <= 0 );            /* rejected, not OOB */
+    asn_delete(it);
+
+    /* full pipeline: packet claiming huge lengths must be rejected cleanly */
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = intCb;
+
+    uint8_t buf[64];
+    buf[0] = 0x30; buf[1] = 0x84; buf[2] = 0x7F; buf[3] = 0xFF; buf[4] = 0xFF; buf[5] = 0xFF;
+    for(int i = 6; i < 20; i++) buf[i] = 0x02;
+
+    int respLen = 0;
+    (void)handlePacketRoute(buf, 20, &respLen, 64, callbacks, callbacksCount, "public", "private");
+    /* rejection is fine; the contract is NO crash / NO OOB / no pool damage */
+    REQUIRE( ASNPool::doubleReleaseAlarms == before );
+
+    delete intCb;
+}
+
+TEST_CASE( "v3.4.3 fuzz F2: hostile version field is validated before the enum cast", "[snmp][v343][fuzz]" ){
+
+    /* v2c GET shell with version integer = 0xFFFFFFFF (not a valid SNMP_VERSION) */
+    uint8_t buf[64];
+    int n = 0;
+    buf[n++] = 0x30; buf[n++] = 0x1E;                  /* outer SEQUENCE */
+    buf[n++] = 0x02; buf[n++] = 0x05;                  /* INTEGER, 5 bytes */
+    for(int i = 0; i < 5; i++) buf[n++] = 0xFF;        /* version = -1 */
+    buf[n++] = 0x04; buf[n++] = 0x06;                  /* community OCTET STRING */
+    memcpy(buf + n, "public", 6); n += 6;
+    buf[n++] = 0xA0; buf[n++] = 0x0D;                  /* GetRequest PDU */
+    buf[n++] = 0x02; buf[n++] = 0x01; buf[n++] = 0x2A; /* request-id 42 */
+    buf[n++] = 0x02; buf[n++] = 0x01; buf[n++] = 0x00; /* error-status */
+    buf[n++] = 0x02; buf[n++] = 0x01; buf[n++] = 0x00; /* error-index */
+    buf[n++] = 0x30; buf[n++] = 0x03;                  /* varbind list */
+    buf[n++] = 0x30; buf[n++] = 0x01;                  /* empty varbind */
+
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = intCb;
+
+    /* the active path (per build) must reject the invalid version without UB */
+    int respLen = 0;
+    SNMP_ERROR_RESPONSE r = handlePacketRoute(buf, n, &respLen, 64, callbacks, callbacksCount, "public", "private");
+    REQUIRE( r == SNMP_REQUEST_INVALID );
+
+    delete intCb;
+}

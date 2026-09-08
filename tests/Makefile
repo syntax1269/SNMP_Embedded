@@ -1,15 +1,18 @@
 BUILD_DIR ?= ./build/build
+# v3.4.3: fuzz/ excluded from the Catch2 suite — it is a standalone harness
+# with its own main() (target: `fuzz`), never linked into tests/mock/example.
 SRC_DIRS ?= ../src . ../examples
+FIND_EXCLUDES := \( -path ./fuzz -o -path ./fuzz/\* \) -prune -o
 
-TEST_SRCS := $(shell find $(SRC_DIRS) -name \*.cpp \! -name mock.cpp \! -name CMakeCXXCompilerId.cpp)
+TEST_SRCS := $(shell find $(SRC_DIRS) $(FIND_EXCLUDES) -name \*.cpp \! -name mock.cpp \! -name CMakeCXXCompilerId.cpp -print)
 TEST_OBJS := $(TEST_SRCS:%=$(BUILD_DIR)/%.o)
 TEST_DEPS := $(TEST_OBJS:.o=.d)
 
-MOCK_SRCS := $(shell find $(SRC_DIRS) -name \*.cpp \! -name SNMP_Embedded.cpp \! -name tests.cpp \! -name CMakeCXXCompilerId.cpp)
+MOCK_SRCS := $(shell find $(SRC_DIRS) $(FIND_EXCLUDES) -name \*.cpp \! -name SNMP_Embedded.cpp \! -name tests.cpp \! -name CMakeCXXCompilerId.cpp -print)
 MOCK_OBJS := $(MOCK_SRCS:%=$(BUILD_DIR)/%.o)
 MOCK_DEPS := $(MOCK_OBJS:.o=.d)
 
-EXAMPLE_SRCS := $(shell find $(SRC_DIRS) \( -name \*.cpp -o -name ESP32_SNMP.ino \) \! -name mock.cpp \! -name tests.cpp \! -name CMakeCXXCompilerId.cpp)
+EXAMPLE_SRCS := $(shell find $(SRC_DIRS) $(FIND_EXCLUDES) \( -name \*.cpp -o -name ESP32_SNMP.ino \) \! -name mock.cpp \! -name tests.cpp \! -name CMakeCXXCompilerId.cpp -print)
 EXAMPLE_OBJS := $(EXAMPLE_SRCS:%=$(BUILD_DIR)/%.o)
 
 .DELETE_ON_ERROR:
@@ -54,7 +57,7 @@ $(BUILD_DIR)/%.ino.o: %.ino
 	rm $@.cpp
 
 
-.PHONY: clean test benchmark example ci-test test-nobuiltinuptime ci-test-nobuiltinuptime test-nozc ci-test-nozc
+.PHONY: clean test benchmark example ci-test test-nobuiltinuptime ci-test-nobuiltinuptime test-nozc ci-test-nozc fuzz fuzz-asan
 
 # v3.3.4: opt-out profile — SNMP_NO_BUILTIN_SYSUPTIME build. Separate BUILD_DIR
 # so the two profiles never share stale objects. Verifies (a) clean compile with
@@ -106,6 +109,24 @@ mock: $(BUILD_DIR)/mock
 	$(BUILD_DIR)/mock
 	
 example: $(BUILD_DIR)/example
+
+# v3.4.3: P0 parser fuzzing (blueprint Phase 3) — standalone deterministic
+# harness over both packet paths + view walk + container decode. Structured
+# adversarial corpus + seeded mutations; invariants: no crash/hang/OOB,
+# input never mutated, pool returns to baseline after every input.
+# ASAN build proves memory safety beyond the harness's own checks.
+fuzz:
+	@mkdir -p build
+	$(CXX) -std=c++11 -DCOMPILING_TESTS -I"../src" -I"../" -Wall -Wextra -g \
+		fuzz/fuzz_parser.cpp required/IPAddress.cpp ../src/*.cpp -o build/fuzz
+	./build/fuzz --cases 20000
+
+fuzz-asan:
+	@mkdir -p build
+	$(CXX) -std=c++11 -DCOMPILING_TESTS -I"../src" -I"../" -Wall -Wextra -g \
+		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		fuzz/fuzz_parser.cpp required/IPAddress.cpp ../src/*.cpp -o build/fuzz-asan
+	./build/fuzz-asan --cases 20000
 
 ci-test: clean test
 

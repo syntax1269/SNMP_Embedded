@@ -31,6 +31,11 @@ jobs:
       - name: Run host tests (clean-first via ci-test to defeat any stale cached .o)
         working-directory: tests
         run: make ci-test
+      - name: P0 parser fuzzing (blueprint Phase 3) — 20k structured+mutated inputs, both packet paths, ASAN/UBSAN
+        working-directory: tests
+        run: |
+          make fuzz
+          make fuzz-asan
 
   compile-examples:
     name: Compile Arduino examples (ESP8266 + ESP32)

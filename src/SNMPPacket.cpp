@@ -47,12 +47,18 @@ SNMP_PACKET_PARSE_ERROR SNMPPacket::parsePacket(ComplexType *structure, enum SNM
 
             case SNMPVERSION:
                 ASSERT_ASN_STATE_TYPE(value, SNMPVERSION);
-                this->snmpVersionPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(static_cast<IntegerType*>(value)->_value));
-                this->snmpVersion = (SNMP_VERSION) this->snmpVersionPtr.get()->_value;
-                if (this->snmpVersion >= SNMP_VERSION_MAX) {
-                    SNMP_LOGW("Invalid SNMP Version: %d\n", this->snmpVersion);
+                {
+                /* v3.4.3 (fuzz finding F2): validate the raw integer BEFORE
+                 * casting — a hostile version field (e.g. 0xFFFFFFFF) made
+                 * the enum cast itself undefined behaviour. */
+                int parsedVersion = static_cast<IntegerType*>(value)->_value;
+                if(parsedVersion < 0 || parsedVersion >= SNMP_VERSION_MAX){
+                    SNMP_LOGW("Invalid SNMP Version: %d\n", parsedVersion);
                     return SNMP_PARSE_ERROR_AT_STATE(SNMPVERSION);
-                };
+                }
+                this->snmpVersionPtr = AsnPtr<IntegerType>(asn_new<IntegerType>(parsedVersion));
+                this->snmpVersion = (SNMP_VERSION) parsedVersion;
+                }
                 state = COMMUNITY;
             break;
 

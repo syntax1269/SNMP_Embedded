@@ -153,12 +153,24 @@ static size_t decode_ber_longform_integer(const uint8_t* buf, long* decoded_inte
     return i;
 }
 
-static size_t decode_ber_length_integer(const uint8_t* buf, int* decoded_integer, int){
+/* v3.4.3 (fuzz finding F1): the long-form length field was read without any
+ * bound check — a TLV header like `02 94` (long form, 20 length bytes) made
+ * this loop read up to 127 bytes past the caller's buffer.  The max_len
+ * parameter (previously ignored) now bounds the read: a length field that
+ * runs off the buffer, or one with more than 4 length bytes (content would
+ * exceed 2^32-1), is a decode error.  Semantics match ber_decode_length()
+ * in BERView.h (the zero-copy path was already strict; the container path
+ * now is too). */
+static size_t decode_ber_length_integer(const uint8_t* buf, int* decoded_integer, int max_len){
+    if(max_len < 1) return 0;
     if(*buf <= 127) {
         *decoded_integer = *buf;
         return 1;
     } else {
         int numBytes = *buf & 0x7F;
+        if(numBytes == 0)               return 0;   /* indefinite form: rejected */
+        if(numBytes >= max_len)         return 0;   /* length field runs off buffer */
+        if(numBytes > 4)                return 0;   /* >2^32-1 content bytes */
         int special_length = 0;
         for(int k = 0; k < numBytes; k++){
             buf++;
@@ -179,7 +191,9 @@ int BER_CONTAINER::fromBuffer(const uint8_t *buf, size_t max_len) {
         return SNMP_BUFFER_ERROR_TYPE_MISMATCH;
     }
     ptr++;
-    ptr += decode_ber_length_integer(ptr, &_length, (int)max_len - 1);
+    size_t lenUsed = decode_ber_length_integer(ptr, &_length, (int)max_len - 1);
+    if(lenUsed == 0) return SNMP_BUFFER_ERROR_MAX_LEN_EXCEEDED;   /* malformed length field */
+    ptr += lenUsed;
     int header_len = static_cast<int>(ptr - buf);
     if(static_cast<size_t>(_length) + header_len > max_len){
         return SNMP_BUFFER_ERROR_MAX_LEN_EXCEEDED;
