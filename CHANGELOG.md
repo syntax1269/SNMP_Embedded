@@ -1,5 +1,41 @@
 # Changelog — SNMP_Embedded
 
+## v3.4.4 — P1 runtime/high-water statistics (blueprint Phase 1)
+
+### Added
+- **`SNMP_RuntimeStats`** (public struct) + **`SNMPAgent::getRuntimeStats(SNMP_RuntimeStats*)`**:
+  pool fields (used / high-water / cap — live reads) and monotonic packet
+  counters since boot: `packets_received`, `packets_rejected` (valid parse,
+  community denied), `malformed_packets` (parse failed), `too_big_responses`
+  (RFC 3416 tooBig answered), `allocation_failures` (pool-exhausted
+  `asn_new`), `double_release_errors`. The deterministic-resource philosophy
+  is now observable from any sketch — no logging required.
+- **`SNMP_ENGINE_MAX_RAM_BYTES`**: compile-time constant for the maximum RAM
+  this library instance can consume (pool arena + packet buffer + worst-case
+  varbind array) — completes the P0 bounded-memory proof as a single number
+  per configuration, with a build-time `static_assert` sanity check.
+- Six new host test cases `[snmp][v344]`: valid traffic leaves counters at
+  baseline; malformed / rejected / tooBig / allocation-failure each move
+  exactly their own counter; `getRuntimeStats` snapshot correctness incl.
+  `packets_received` through a feeding-UDP `loop()`; the bounded-RAM constant
+  sanity. The mock UDP stub is now virtual so tests can feed datagrams.
+
+### Counting contract (both packet paths)
+- `malformed_packets` and `packets_rejected` are mutually exclusive (a packet
+  is either a parse failure or a community denial, never both).
+- `too_big_responses` is counted at the RFC 3416 tooBig **decisions** (GetBulk
+  expansion cap, response-fit rebuild), not by return code — a genErr response
+  shares `SNMP_ERROR_PACKET_SENT`, so return-code counting would conflate them.
+- `allocation_failures` counts pool-exhausted `asn_new` calls (counted before
+  the host-test heap fallback, so the event is recorded on every build).
+- Both the zero-copy and classic paths increment the same counters at the same
+  points; the same test file asserts +1 deltas under both profiles.
+
+### Validation
+- Host matrix: default **2,193 assertions / 38 cases**, zero-copy-off **330 / 33**,
+  no-builtin-uptime **2,125 / 33**, no-traps **2,111 / 33** — all green.
+- Fuzz (ASAN/UBSAN): unchanged green — 20,014 inputs, zero runtime errors.
+
 ## v3.4.3 — P0 parser fuzzing (blueprint Phase 3): two real decoder bugs found and fixed
 
 ### Added

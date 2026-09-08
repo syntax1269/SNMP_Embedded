@@ -88,6 +88,24 @@ The arena is **locked in at boot**: every `SNMPAgent` constructor calls `ASNPool
 
 Slot size is pinned to the measured largest BER container by exhaustive `static_assert`s — if a container grows, the build fails loudly instead of silently corrupting.
 
+**For configuration X, the maximum RAM consumption of the SNMP engine is `SNMP_ENGINE_MAX_RAM_BYTES`** (v3.4.4): the pool arena (`SNMP_POOL_ASN_OBJECTS x SNMP_POOL_SLOT_SIZE`) plus the UDP packet buffer (`MAX_SNMP_PACKET_LENGTH`) plus the worst-case varbind array (`SNMP_MAX_VARBINDS x sizeof(VarBind)`) — a compile-time constant, printed by the harness per profile and asserted sane at build time.
+
+### Runtime observability (v3.4.4)
+
+The deterministic-resource philosophy is **observable, not just documented**. Any sketch can snapshot the agent's monotonic counters since boot:
+
+```cpp
+SNMP_RuntimeStats stats;
+snmp.getRuntimeStats(&stats);
+Serial.printf("rx=%u malformed=%u rejected=%u tooBig=%u allocFail=%u pool %u/%u (peak %u)\n",
+    (unsigned)stats.packets_received, (unsigned)stats.malformed_packets,
+    (unsigned)stats.packets_rejected, (unsigned)stats.too_big_responses,
+    (unsigned)stats.allocation_failures, (unsigned)stats.pool_used,
+    (unsigned)stats.pool_cap, (unsigned)stats.pool_high_water);
+```
+
+Pool fields are live reads; packet counters are monotonic since boot. `malformed_packets` counts parse failures, `packets_rejected` counts valid-but-community-denied, `too_big_responses` counts RFC 3416 tooBig PDUs answered, `allocation_failures` counts pool-exhausted `asn_new` returns, `double_release_errors` counts pool double-destroy alarms. Both packet paths (zero-copy and classic) count identically — host-tested per profile.
+
 ### !! Size overrides and the One-Definition Rule !!
 
 Never `#define` size-affecting flags (`SNMP_MAX_CALLBACKS_PER_AGENT`, `SNMP_POOL_*`, `OCTET_TYPE_MAX_LENGTH`, `SNMP_MAX_OID_STR_LEN`, ...) **inside a sketch file**. They change class layout, so a sketch-only define makes the sketch and the compiled library disagree about object sizes → undefined behavior (on ESP8266, observed live: instant reboot loops). Set them as **global build flags** so every translation unit agrees:
@@ -444,6 +462,14 @@ Two honesty notes that the harness proved rather than assumed:
 
 ## Version History
 
+- **v3.4.4** — **P1 runtime/high-water statistics (blueprint Phase 1).** New
+  `SNMP_RuntimeStats` struct + `snmp.getRuntimeStats()`: pool used/peak/cap
+  plus monotonic counters for packets received, community-rejected, malformed,
+  tooBig answered, pool allocation failures, and double-release alarms — the
+  library's deterministic-resource guarantees become observable from any
+  sketch. Compile-time `SNMP_ENGINE_MAX_RAM_BYTES` completes the bounded-memory
+  proof (config X → max engine RAM = Y bytes). Additive: zero class-layout
+  change, zero behavior change. See the [CHANGELOG](CHANGELOG.md).
 - **v3.4.3** — **P0 parser fuzzing (production hardening, blueprint Phase 3).**
   A deterministic host fuzzer (structured adversarial corpus + seeded
   mutations over both packet paths, the view walk, and container decode,

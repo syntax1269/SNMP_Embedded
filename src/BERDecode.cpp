@@ -52,6 +52,13 @@ bool ASNPool::permFrozen = false;
 uint32_t ASNPool::lockInMs = 0;
 int ASNPool::doubleReleaseAlarms = 0;
 
+/* v3.4.4 (P1): runtime observability counters (SNMPAgent::getRuntimeStats). */
+size_t ASNPool::packetsReceived      = 0;
+size_t ASNPool::packetsRejected      = 0;
+size_t ASNPool::malformedPackets     = 0;
+size_t ASNPool::tooBigResponses      = 0;
+size_t ASNPool::allocationFailures   = 0;
+
 void ASNPool::release(BER_CONTAINER* p){
     if(!p) return;
 #ifndef SNMP_POOLS_IN_BSS

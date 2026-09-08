@@ -468,15 +468,18 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
 
     SnmpHeaderView request;
     if(!snmp_ber_peek_packet(buffer, (size_t)packetLength, &request)){
+        ASNPool::malformedPackets++;   /* v3.4.4 (P1) */
         return SNMP_REQUEST_INVALID;
     }
     if(request.varbindsTruncated || request.varbindCount > SNMP_MAX_VARBINDS){
+        ASNPool::malformedPackets++;   /* v3.4.4 (P1) */
         return SNMP_REQUEST_INVALID;
     }
 
     /* Decode all request values before any callback or response write. */
     AsnPtr<BER_CONTAINER> decoded[SNMP_MAX_VARBINDS];
     if(!decodeRequestValues(request, decoded, buffer, (size_t)packetLength)){
+        ASNPool::malformedPackets++;   /* v3.4.4 (P1) */
         return SNMP_REQUEST_INVALID;
     }
 
@@ -520,6 +523,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
         permission = SNMP_PERM_READ_WRITE;
     }
     if(permission == SNMP_PERM_NONE){
+        ASNPool::packetsRejected++;   /* v3.4.4 (P1): valid parse, community denied */
         return SNMP_REQUEST_INVALID_COMMUNITY;
     }
 
@@ -533,6 +537,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
             if(!stageGet(plan, callbacks, callbacksCount, request, false)){
                 globalError = true;
                 globalErrorStatus = TOO_BIG;
+                ASNPool::tooBigResponses++;   /* v3.4.4 (P1) */
             }
             successResponse = SNMP_GET_OCCURRED;
             break;
@@ -541,6 +546,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
             if(!stageGet(plan, callbacks, callbacksCount, request, true)){
                 globalError = true;
                 globalErrorStatus = TOO_BIG;
+                ASNPool::tooBigResponses++;   /* v3.4.4 (P1) */
             }
             successResponse = SNMP_GETNEXT_OCCURRED;
             break;
@@ -552,6 +558,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
             } else if(!stageGetBulk(plan, callbacks, callbacksCount, request)){
                 globalError = true;
                 globalErrorStatus = TOO_BIG;
+                ASNPool::tooBigResponses++;   /* v3.4.4 (P1) */
             }
             successResponse = SNMP_GETBULK_OCCURRED;
             break;
@@ -563,6 +570,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
             } else if(!stageSet(plan, callbacks, callbacksCount, request, decoded)){
                 globalError = true;
                 globalErrorStatus = TOO_BIG;
+                ASNPool::tooBigResponses++;   /* v3.4.4 (P1) */
             }
             successResponse = SNMP_SET_OCCURRED;
             break;
@@ -599,6 +607,7 @@ SNMP_ERROR_RESPONSE handlePacketInPlace(uint8_t* buffer, int packetLength,
     /* A normal response that does not fit is rebuilt as the small RFC 3416
      * tooBig response, just like the owning path.  SET side effects have
      * already occurred in Phase A, matching the owning path's ordering. */
+    ASNPool::tooBigResponses++;   /* v3.4.4 (P1): response-fit tooBig */
     if(writeErrorResponse(buffer, (size_t)max_packet_size, request,
                           communityWire, communityWireLen,
                           TOO_BIG, responseLength)){

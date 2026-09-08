@@ -57,6 +57,23 @@ struct ASNPool {
     static int permCount;
     static int usedCountPeak;   /* high-water mark since boot — diagnostics */
     static int doubleReleaseAlarms; /* v3.3.3: count of TRUE double-destroy alarms (not bulkFree stale deletes) — host-test verification */
+
+    /* v3.4.4 (P1 — blueprint Phase 1 diagnostic structure): monotonic
+     * runtime counters since boot.  Sketch-facing snapshot via
+     * SNMPAgent::getRuntimeStats().  Plain size_t statics (same pattern as
+     * usedCountPeak / doubleReleaseAlarms): no class-layout change, ODR-safe
+     * with per-TU flag overrides.  Counting contract (both packet paths):
+     *   packetsReceived      -> SNMPAgent::loop() per datagram read
+     *   packetsRejected      -> valid parse, community denied (no response)
+     *   malformedPackets     -> parse failed (SNMP_REQUEST_INVALID)
+     *   tooBigResponses      -> RFC 3416 tooBig decided (bulk cap / response fit)
+     *   allocationFailures   -> asn_new pool exhaustion (rawAlloc nullptr)
+     *   doubleReleaseErrors  -> doubleReleaseAlarms alias (host-verified) */
+    static size_t packetsReceived;
+    static size_t packetsRejected;
+    static size_t malformedPackets;
+    static size_t tooBigResponses;
+    static size_t allocationFailures;
     static bool permFrozen;     /* true once the startup baseline is frozen */
     static uint32_t lockInMs;   /* v3.3.0: millis() reading when the arena was pre-allocated (0 = not locked at ctor time / static BSS) */
 
@@ -162,6 +179,10 @@ static inline T* asn_new(Args&&... args){
         T* obj = ::new (slot) T(std::forward<Args>(args)...);
         return obj;
     }
+    /* v3.4.4 (P1): pool exhaustion is now a counter, not just a log line.
+     * Counted BEFORE the host fallback so the event is recorded on every
+     * build (host tests force exhaustion deliberately to verify it). */
+    ASNPool::allocationFailures++;
 #ifdef COMPILING_TESTS
     /* Native host tests: pool capacity is a logic stress-test vector, not a
        hard safety bound.  Host has GB of free RAM so falling back to operator

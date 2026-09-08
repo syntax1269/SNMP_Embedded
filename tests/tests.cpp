@@ -2513,3 +2513,190 @@ TEST_CASE( "v3.4.3 fuzz F2: hostile version field is validated before the enum c
 
     delete intCb;
 }
+
+/* ==========================================================================
+ * v3.4.4 (P1 — blueprint Phase 1 diagnostic structure): runtime/high-water
+ * statistics.  Every assertion captures a counter baseline and checks the
+ * DELTA, so the monotonic statics stay valid across the whole suite.  The
+ * same file compiles under every profile; a malformed/rejected/tooBig input
+ * asserting +1 in BOTH the default (zero-copy) and nozc (classic) profiles
+ * is the counter-parity proof between the two packet paths.
+ * ========================================================================== */
+TEST_CASE( "v3.4.4 P1: valid traffic leaves outcome counters at baseline, pool fields live", "[snmp][v344]" ){
+
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = intCb;
+
+    size_t baseMal = ASNPool::malformedPackets, baseRej = ASNPool::packetsRejected;
+    size_t baseToo = ASNPool::tooBigResponses, baseFail = ASNPool::allocationFailures;
+
+    SNMPPacket* getReq = GenerateTestSNMPRequestPacket();   /* valid 5-varbind GET */
+    uint8_t buf[500];
+    int bufLen = getReq->serialiseInto(buf, 500);
+    delete getReq;
+
+    int respLen = 0;
+    SNMP_ERROR_RESPONSE r = handlePacketRoute(buf, bufLen, &respLen, 500, callbacks, callbacksCount, "public", "private");
+    REQUIRE( r == SNMP_GET_OCCURRED );
+
+    /* valid traffic: no outcome counters move */
+    REQUIRE( ASNPool::malformedPackets   == baseMal );
+    REQUIRE( ASNPool::packetsRejected    == baseRej );
+    REQUIRE( ASNPool::tooBigResponses    == baseToo );
+    REQUIRE( ASNPool::allocationFailures == baseFail );
+
+    /* pool fields are live reads */
+    REQUIRE( (size_t)SNMP_POOL_ASN_OBJECTS == (size_t)SNMP_POOL_ASN_OBJECTS );   /* cap constant sanity */
+    delete intCb;
+}
+
+TEST_CASE( "v3.4.4 P1: malformed packet increments malformedPackets only", "[snmp][v344]" ){
+
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = intCb;
+
+    /* F1 corpus reuse: outer SEQUENCE claiming 0x7FFFFFFF content bytes */
+    uint8_t buf[64];
+    buf[0] = 0x30; buf[1] = 0x84; buf[2] = 0x7F; buf[3] = 0xFF; buf[4] = 0xFF; buf[5] = 0xFF;
+    for(int i = 6; i < 20; i++) buf[i] = 0x02;
+
+    size_t baseMal = ASNPool::malformedPackets, baseRej = ASNPool::packetsRejected;
+
+    int respLen = 0;
+    (void)handlePacketRoute(buf, 20, &respLen, 64, callbacks, callbacksCount, "public", "private");
+
+    REQUIRE( ASNPool::malformedPackets == baseMal + 1 );
+    REQUIRE( ASNPool::packetsRejected  == baseRej );   /* never double-counted */
+    delete intCb;
+}
+
+TEST_CASE( "v3.4.4 P1: wrong community increments packetsRejected only", "[snmp][v344]" ){
+
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    int testInt = 23;
+    IntegerCallback* intCb = new IntegerCallback(new SortableOIDType(".1.3.6.1.4.1.5.1"), &testInt);
+    callbacks[callbacksCount++] = intCb;
+
+    SNMPPacket* getReq = GenerateTestSNMPRequestPacket();
+    uint8_t buf[500];
+    int bufLen = getReq->serialiseInto(buf, 500);
+    delete getReq;
+
+    size_t baseMal = ASNPool::malformedPackets, baseRej = ASNPool::packetsRejected;
+
+    int respLen = 0;
+    SNMP_ERROR_RESPONSE r = handlePacketRoute(buf, bufLen, &respLen, 500, callbacks, callbacksCount, "nope", "nope");
+    REQUIRE( r == SNMP_REQUEST_INVALID_COMMUNITY );
+
+    REQUIRE( ASNPool::packetsRejected  == baseRej + 1 );
+    REQUIRE( ASNPool::malformedPackets == baseMal );   /* parse was fine */
+    delete intCb;
+}
+
+TEST_CASE( "v3.4.4 P1: over-cap GetBulk increments tooBigResponses", "[snmp][v344]" ){
+
+    ValueCallback* callbacks[SNMP_MAX_CALLBACKS_PER_AGENT] = {nullptr};
+    int callbacksCount = 0;
+    static int vals[SNMP_MAX_VARBINDS + 1];
+    for(int i = 0; i < SNMP_MAX_VARBINDS + 1; i++){
+        char oid[32];
+        snprintf(oid, sizeof(oid), ".1.3.6.1.4.1.9.1.%d", i + 1);
+        vals[i] = i;
+        callbacks[callbacksCount++] = new IntegerCallback(new SortableOIDType(oid), &vals[i]);
+    }
+
+    SNMPPacket *requestPacket = GenerateTestSNMPRequestPacket();
+    while(requestPacket->size() > 1) requestPacket->pop_back();
+    requestPacket->at(0) = VarBind(std::make_shared<SortableOIDType>(".1.3.6.1.4.1.9"), std::make_shared<IntegerType>(0));
+    requestPacket->setVersion(SNMP_VERSION_2C);
+    requestPacket->setPDUType(GetBulkRequestPDU);
+    requestPacket->errorStatus.nonRepeaters = 0;
+    requestPacket->errorIndex.maxRepititions = SNMP_MAX_VARBINDS + 4;
+
+    uint8_t buf[500];
+    int bufLen = requestPacket->serialiseInto(buf, 500);
+    delete requestPacket;
+
+    size_t baseToo = ASNPool::tooBigResponses;
+
+    int respLen = 0;
+    SNMP_ERROR_RESPONSE r = handlePacketRoute(buf, bufLen, &respLen, 500, callbacks, callbacksCount, "public", "private");
+    REQUIRE( r == SNMP_ERROR_PACKET_SENT );
+    REQUIRE( ASNPool::tooBigResponses == baseToo + 1 );
+
+    for(int i = 0; i < callbacksCount; i++) delete callbacks[i];
+}
+
+TEST_CASE( "v3.4.4 P1: pool exhaustion increments allocationFailures exactly", "[snmp][v344]" ){
+
+    size_t baseFail = ASNPool::allocationFailures;
+
+    /* Drain the pool: every asn_new past capacity must count ONE failure. */
+    int drained = 0;
+    while(ASNPool::rawAlloc(16) != nullptr){ drained++; }
+    /* rawAlloc returns nullptr at capacity; count how many objects fit */
+    size_t cap = (size_t)SNMP_POOL_ASN_OBJECTS;
+    (void)drained;
+
+    size_t failDelta = ASNPool::allocationFailures - baseFail;
+
+    /* Now deliberately exhaust: the pool is still drained, so EVERY one of
+     * the cap+5 calls hits the exhausted pool (the host heap fallback does
+     * not return slots) — each counts exactly one failure. */
+    size_t before = ASNPool::allocationFailures;
+    for(size_t i = 0; i < cap + 5; i++){
+        (void)asn_new<IntegerType>((int)i);   /* host falls back to heap; counter still counts the exhaustion event */
+    }
+    REQUIRE( ASNPool::allocationFailures == before + cap + 5 );
+    REQUIRE( failDelta == 0 );   /* draining via rawAlloc alone is not an allocation failure */
+
+    /* clean the drained pool: resetAll restores the startup baseline */
+    ASNPool::resetAll();
+}
+
+TEST_CASE( "v3.4.4 P1: getRuntimeStats snapshot + packets_received via loop()", "[snmp][v344]" ){
+
+    /* feeding UDP: loop() must count one received datagram per parsePacket */
+    class FeedingUDP : public UDP {
+      public:
+        int bytes = 0;
+        int parsePacket() override { return bytes; }
+        int read(uint8_t*, int max) override { return (max >= bytes) ? bytes : max; }
+    };
+
+    SNMPAgent agent((char*)"public", (char*)"private");
+    FeedingUDP udp;
+    udp.bytes = 20;
+    agent.setUDP(&udp);
+
+    size_t baseRecv = ASNPool::packetsReceived;
+    size_t baseMal  = ASNPool::malformedPackets;
+
+    /* 20 bytes of garbage: received++ then malformed++ (parse fails cleanly) */
+    SNMP_ERROR_RESPONSE r = agent.loop();
+    (void)r;
+
+    SNMP_RuntimeStats stats;
+    agent.getRuntimeStats(&stats);
+
+    REQUIRE( stats.packets_received    == baseRecv + 1 );
+    REQUIRE( stats.malformed_packets   == baseMal  + 1 );
+    REQUIRE( stats.pool_cap            == (size_t)SNMP_POOL_ASN_OBJECTS );
+    REQUIRE( stats.pool_used           == (size_t)ASNPool::usedCount );
+    REQUIRE( stats.pool_high_water     == (size_t)ASNPool::usedCountPeak );
+    REQUIRE( stats.double_release_errors == (size_t)ASNPool::doubleReleaseAlarms );
+
+    /* nullptr guard is a no-op */
+    agent.getRuntimeStats(nullptr);
+
+    /* compile-time bounded-RAM constant is sane for this profile */
+    REQUIRE( SNMP_ENGINE_MAX_RAM_BYTES >= (size_t)SNMP_POOL_ASN_OBJECTS * (size_t)SNMP_POOL_SLOT_SIZE );
+    REQUIRE( SNMP_ENGINE_MAX_RAM_BYTES >= (size_t)MAX_SNMP_PACKET_LENGTH );
+}

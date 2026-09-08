@@ -20,6 +20,7 @@ SNMP_ERROR_RESPONSE handlePacket(uint8_t* buffer, int packetLength, int* respons
     SNMP_PACKET_PARSE_ERROR parseResult = request.parseFrom(buffer, packetLength);
     if(parseResult <= 0){
         SNMP_LOGW("Received Error code: %d when attempting to parse\n", parseResult);
+        ASNPool::malformedPackets++;   /* v3.4.4 (P1) */
         return SNMP_REQUEST_INVALID;
     }
 
@@ -38,6 +39,7 @@ SNMP_ERROR_RESPONSE handlePacket(uint8_t* buffer, int packetLength, int* respons
     SNMP_PERMISSION requestPermission = getPermissionOfRequest(request, _community, _readOnlyCommunity);
     if(requestPermission == SNMP_PERM_NONE){
         SNMP_LOGW("Invalid communitystring provided: %s, no response to give\n", request.communityString);
+        ASNPool::packetsRejected++;   /* v3.4.4 (P1): valid parse, community denied */
         return SNMP_REQUEST_INVALID_COMMUNITY;
     }
 
@@ -72,6 +74,7 @@ SNMP_ERROR_RESPONSE handlePacket(uint8_t* buffer, int packetLength, int* respons
                     SNMP_LOGW("GetBulk expansion exceeds SNMP_MAX_VARBINDS (%d): responding tooBig (was: silently truncated). Raise SNMP_MAX_VARBINDS via sketch #define before #include <SNMP_Embedded.h>.\n", SNMP_MAX_VARBINDS);
                     pass = false;
                     globalError = TOO_BIG;
+                    ASNPool::tooBigResponses++;   /* v3.4.4 (P1) */
                 }
                 handleStatus = SNMP_GETBULK_OCCURRED;
             }
@@ -131,6 +134,7 @@ SNMP_ERROR_RESPONSE handlePacket(uint8_t* buffer, int packetLength, int* respons
          * overflow, so rebuilding into the same buffer is always safe. */
         SNMP_LOGW("Response of %d varbind(s) exceeds packet budget (%d B): rebuilding as tooBig (RFC 3416).\n",
                   response.size(), (int)max_packet_size);
+        ASNPool::tooBigResponses++;   /* v3.4.4 (P1): response-fit tooBig */
         SNMPResponse tooBigResponse(request);
         tooBigResponse.setGlobalError(TOO_BIG, 0, true);
         memset(buffer, 0, max_packet_size);

@@ -27,6 +27,36 @@
 #include "include/defs.h"
 #include "include/SNMPInform.h"
 
+/* v3.4.4 (P1 — blueprint Phase 1 diagnostic structure): runtime
+ * observability snapshot.  POD, no allocation, no locks — safe to call
+ * from any context.  Pool fields are live snapshots; packet counters are
+ * monotonic since boot.  The library's deterministic-resource philosophy
+ * is observable, not merely documented. */
+struct SNMP_RuntimeStats {
+    size_t pool_used;             /* ASNPool::usedCount (live)             */
+    size_t pool_high_water;       /* ASNPool::usedCountPeak (since boot)   */
+    size_t pool_cap;              /* SNMP_POOL_ASN_OBJECTS                 */
+
+    size_t packets_received;      /* UDP datagrams read by loop()          */
+    size_t packets_rejected;      /* valid parse, community denied         */
+    size_t malformed_packets;     /* parse failed (SNMP_REQUEST_INVALID)   */
+    size_t too_big_responses;     /* RFC 3416 tooBig PDUs answered         */
+    size_t allocation_failures;   /* pool exhausted (asn_new nullptr)      */
+    size_t double_release_errors; /* ASNPool::doubleReleaseAlarms          */
+};
+
+/* v3.4.4 (P1): compile-time proof of bounded engine memory — the
+ * deterministic maximum RAM this library instance can consume:
+ * pool arena + UDP packet buffer + worst-case varbind array.
+ * Config X => maximum engine RAM is this many bytes. */
+#define SNMP_ENGINE_MAX_RAM_BYTES                                      \
+    ( (size_t)(SNMP_POOL_ASN_OBJECTS) * (size_t)(SNMP_POOL_SLOT_SIZE)  \
+      + (size_t)(MAX_SNMP_PACKET_LENGTH)                               \
+      + (size_t)(SNMP_MAX_VARBINDS) * sizeof(VarBind) )
+
+static_assert( SNMP_ENGINE_MAX_RAM_BYTES >= (size_t)(SNMP_POOL_ASN_OBJECTS * SNMP_POOL_SLOT_SIZE),
+               "v3.4.4: SNMP_ENGINE_MAX_RAM_BYTES must cover at least the pool arena" );
+
 /* v3.3.4: record of what addRFC1213SystemGroup() actually registered.
  * sysUpTime is nullptr here when the built-in dynamic uptime is active
  * (default build) — it has no user handle by design. */
@@ -228,6 +258,11 @@ class SNMPAgent {
         begin(const char* oidPrefix);
         void stop();
 	    enum SNMP_ERROR_RESPONSE loop();
+
+        /* v3.4.4 (P1): runtime/high-water observability.  Fills *out from
+         * the library's monotonic counters (pool fields are live reads).
+         * No-op on nullptr.  No allocation, no side effects. */
+        void getRuntimeStats(SNMP_RuntimeStats* out) const;
 
         short AgentUDPport = 161;
         void setUDPport(short port){

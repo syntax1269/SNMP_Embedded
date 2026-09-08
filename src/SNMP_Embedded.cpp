@@ -235,6 +235,19 @@ void SNMPAgent::begin(const char* prefix){
     this->begin();
 }
 
+void SNMPAgent::getRuntimeStats(SNMP_RuntimeStats* out) const{
+    if(!out) return;
+    out->pool_used             = (size_t)ASNPool::usedCount;
+    out->pool_high_water       = (size_t)ASNPool::usedCountPeak;
+    out->pool_cap              = (size_t)SNMP_POOL_ASN_OBJECTS;
+    out->packets_received      = ASNPool::packetsReceived;
+    out->packets_rejected      = ASNPool::packetsRejected;
+    out->malformed_packets     = ASNPool::malformedPackets;
+    out->too_big_responses     = ASNPool::tooBigResponses;
+    out->allocation_failures   = ASNPool::allocationFailures;
+    out->double_release_errors = (size_t)ASNPool::doubleReleaseAlarms;
+}
+
 void SNMPAgent::stop(){
     for(int i = 0; i < udpCount; i++){
         _udp[i]->stop();
@@ -261,6 +274,7 @@ SNMP_ERROR_RESPONSE SNMPAgent::loop(){
         UDP* udp = _udp[i];
         int packetLength = udp->parsePacket();
         if(packetLength > 0){
+            ASNPool::packetsReceived++;   /* v3.4.4 (P1): every datagram read */
             SNMP_LOGI("loop: UDP[%d] parsePacket=%d bytes remote=%s:%d\n",
                       i, packetLength, udp->remoteIP().toString().c_str(), udp->remotePort());
 
