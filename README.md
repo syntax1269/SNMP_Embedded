@@ -82,7 +82,7 @@ Pinning a tag keeps a device build reproducible. Use a deliberately selected new
 - `SNMP_ENGINE_MAX_RAM_BYTES` compile-time maximum engine footprint.
 - `SNMP_RuntimeStats` pool and packet counters.
 - `SNMP_NO_TRAPS` and `SNMP_NO_BUILTIN_SYSUPTIME` footprint controls.
-- Arduino Ethernet, ESP8266, and ESP32 examples.
+- ESP8266, and ESP32 examples.
 
 The library is optimized for ESP8266 and other memory-constrained Arduino-compatible devices, while retaining a portable UDP-based integration model.
 
@@ -232,8 +232,6 @@ The results demonstrate stable resource behavior under the tested conditions. Ne
 
 - `examples/ESP32_SNMP` — Wi-Fi agent with custom values and notifications.
 - `examples/SNMP_Sensor` — larger sensor and management-information example.
-- `examples/UNO_Ethernet_Minimal` — Arduino UNO and W5100 starting point.
-- `examples/UNO_Ethernet_System` — Arduino UNO system-group example.
 - `extras/demos` — additional Wi-Fi and Ethernet integration examples.
 
 ---
